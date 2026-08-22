@@ -1,0 +1,1 @@
+gcloud run deploy order-verify --source . --set-env-vars ANTHROPIC_API_KEY="sk-ant-مفتاحك_الحقيقي_هنا" --region us-central1 --allow-unauthenticated
