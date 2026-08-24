@@ -1,4 +1,4 @@
-import os, subprocess, tempfile, base64, json
+import os, re, subprocess, tempfile, base64, json
 from pathlib import Path
 import httpx
 from fastapi import FastAPI
@@ -7,6 +7,51 @@ from anthropic import Anthropic
 
 app = FastAPI()
 client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+
+
+def extract_first_json_object(text: str) -> str | None:
+    """
+    يبحث عن أول '{' في النص ثم يتتبّع الأقواس المعقوفة بشكل متوازن
+    (مع تجاهل أي '{' أو '}' تقع داخل نص JSON محاط بعلامتي اقتباس)
+    حتى يصل للقوس المغلق المطابق تمامًا، ويرجع أول كائن JSON كامل
+    ومتوازن كنص خام.
+
+    هذا يتجاهل تلقائيًا أي شيء حول الكائن — code fence (```json أو ```
+    بأي ترتيب/شكل)، نص عربي إضافي قبله أو بعده، أو حتى كلمة "json"
+    نفسها — لأنه لا يعتمد على تفكيك الـ fence إطلاقاً، فقط على تطابق
+    الأقواس. يرجع None إذا لم يوجد '{' أصلاً أو لم يوجد إغلاق متوازن له.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+
+    for i in range(start, len(text)):
+        ch = text[i]
+
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+
+    return None
+
 
 class VerifyRequest(BaseModel):
     video_url: str
@@ -79,7 +124,11 @@ def verify_order(req: VerifyRequest):
         )
 
         raw = msg.content[0].text.strip()
-        raw = raw.replace("json", "").replace("", "").strip()
+
+        extracted = extract_first_json_object(raw)
+        if extracted is not None:
+            raw = extracted
+
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
