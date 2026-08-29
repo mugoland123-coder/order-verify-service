@@ -8,7 +8,6 @@ from anthropic import Anthropic
 app = FastAPI()
 client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-
 def extract_first_json_object(text: str) -> str | None:
     """
     يبحث عن أول '{' في النص ثم يتتبّع الأقواس المعقوفة بشكل متوازن
@@ -51,7 +50,6 @@ def extract_first_json_object(text: str) -> str | None:
                 return text[start:i + 1]
 
     return None
-
 
 class VerifyRequest(BaseModel):
     video_url: str
@@ -106,9 +104,20 @@ def verify_order(req: VerifyRequest):
             "- 'text_list' إذا اعتمدت على ورقة نصية بأسماء/أكواد الأصناف ظاهرة بالفيديو\n"
             "- 'mixed' إذا استخدمت الاثنين معاً لأصناف مختلفة\n"
             "- 'not_applicable' إذا كانت كل الأصناف عليها ملصق واضح ولم تحتج مرجعاً بديلاً\n\n"
+            "تفاصيل إضافية مطلوبة لكل صنف على حدة:\n"
+            "- weight: الوزن أو الحجم المطبوع على ملصق العبوة نفسها فقط، كما يظهر نصياً بالضبط "
+            "(مثال: '250 جرام'، '1 كيلو'). استخرجه من الملصق فقط، وضع null إذا لم يظهر وزن/حجم "
+            "واضح ومقروء على العبوة.\n"
+            "- price: سعر هذا الصنف تحديداً كما يظهر على شاشة تطبيق التوصيل (شاشة تفاصيل الطلب "
+            "في الفيديو) — وليس من ملصق العبوة أو من أي مصدر آخر. ضع الرقم فقط بدون رمز العملة "
+            "إذا ظهر بوضوح مرتبطاً بهذا الصنف تحديداً، أو null إذا لم يظهر سعر فردي واضح لهذا "
+            "الصنف على شاشة التطبيق.\n"
+            "لا تخمّن أي قيمة وزن أو سعر غير ظاهرة بوضوح — استخدم null دائماً بدل التخمين.\n\n"
             "أعد النتيجة بصيغة JSON فقط بدون أي نص إضافي، وفق الحقول التالية بالضبط:\n"
             '{"order_code": "الرقم الطويل من شاشة التطبيق، أو null إن لم يظهر", '
-            '"items": ["قائمة الأصناف المكتشفة، كل صنف بكوده إن توفر أو وصفه إن لم يتوفر كود"], '
+            '"items": [{"name": "اسم/كود الصنف كما يظهر أو وصفه إن لم يتوفر كود", '
+            '"weight": "الوزن/الحجم من ملصق العبوة أو null", '
+            '"price": "سعر الصنف من شاشة التطبيق أو null"}], '
             '"order_source_hint": "image_catalog|text_list|mixed|not_applicable", '
             '"confidence": "high|medium|low"}'
         )
@@ -119,7 +128,7 @@ def verify_order(req: VerifyRequest):
 
         msg = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=1000,
+            max_tokens=1500,
             messages=[{"role": "user", "content": content}]
         )
 
