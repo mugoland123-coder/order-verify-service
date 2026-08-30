@@ -62,6 +62,26 @@ def extract_frames(video_path: str, out_dir: str, fps: float = 1.0):
     )
     return sorted(Path(out_dir).glob("frame_*.jpg"))
 
+def select_frames_covering_full_video(frames, max_frames: int = 30):
+    """
+    يرجّع مجموعة إطارات موزّعة بالتساوي على طول الفيديو كاملاً (من أوله إلى
+    آخره)، بدل الاكتفاء بأول N إطار فقط. هذا مهم لأن شاشة تطبيق التوصيل
+    (وبالتالي السعر) قد لا تظهر إلا في جزء متأخر من الفيديو — بعد فتح
+    الطرد مثلاً — وكانت أول 20 إطاراً (أول 20 ثانية فقط عند fps=1) قد
+    تفوّت هذا الجزء تماماً وترجع السعر null رغم وجوده فعلياً بالفيديو.
+
+    إذا كان عدد الإطارات أقل من أو يساوي max_frames، تُرجع كلها كما هي.
+    """
+    total = len(frames)
+    if total <= max_frames:
+        return frames
+
+    step = total / max_frames
+    indices = sorted({int(i * step) for i in range(max_frames)})
+    if indices[-1] != total - 1:
+        indices[-1] = total - 1
+    return [frames[i] for i in indices]
+
 @app.post("/verify-order")
 def verify_order(req: VerifyRequest):
     with tempfile.TemporaryDirectory() as tmp:
@@ -75,8 +95,10 @@ def verify_order(req: VerifyRequest):
         if not frames:
             return {"status": "error", "reason": "no_frames_extracted"}
 
+        selected_frames = select_frames_covering_full_video(frames, max_frames=30)
+
         content = []
-        for fp in frames[:20]:
+        for fp in selected_frames:
             img_b64 = base64.b64encode(fp.read_bytes()).decode()
             content.append({
                 "type": "image",
@@ -113,6 +135,12 @@ def verify_order(req: VerifyRequest):
             "إذا ظهر بوضوح مرتبطاً بهذا الصنف تحديداً، أو null إذا لم يظهر سعر فردي واضح لهذا "
             "الصنف على شاشة التطبيق.\n"
             "لا تخمّن أي قيمة وزن أو سعر غير ظاهرة بوضوح — استخدم null دائماً بدل التخمين.\n\n"
+            "مهم جداً بخصوص السعر تحديداً: شاشة تطبيق التوصيل التي تُظهر سعر كل صنف قد لا تظهر "
+            "إلا في إطار واحد فقط من بين كل الإطارات المرفقة لك (قد تكون في بداية الفيديو أو "
+            "وسطه أو آخره)، بينما تُظهر بقية الإطارات فتح الطرد أو ملصقات المنتجات. لذلك قبل أن "
+            "تضع price كـ null لأي صنف، افحص كل إطار مرفق لك بالكامل، واحداً تلو الآخر، بحثاً عن "
+            "شاشة تفاصيل الطلب — ولا تكتفِ بفحص أول إطار أو آخر إطار فقط. عدم ظهور شاشة السعر في "
+            "الإطارات الأولى لا يعني إطلاقاً عدم وجودها في إطار لاحق.\n\n"
             "أعد النتيجة بصيغة JSON فقط بدون أي نص إضافي، وفق الحقول التالية بالضبط:\n"
             '{"order_code": "الرقم الطويل من شاشة التطبيق، أو null إن لم يظهر", '
             '"items": [{"name": "اسم/كود الصنف كما يظهر أو وصفه إن لم يتوفر كود", '
