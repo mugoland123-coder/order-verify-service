@@ -55,11 +55,18 @@ class VerifyRequest(BaseModel):
     video_url: str
     invoice_text: str | None = None
 
+class FFmpegExtractionError(Exception):
+    """يُرفع عند فشل ffmpeg تقنياً أثناء استخراج إطارات فيديو معيّن."""
+    pass
+
 def extract_frames(video_path: str, out_dir: str, fps: float = 1.0):
-    subprocess.run(
-        ["ffmpeg", "-i", video_path, "-vf", f"fps={fps}", f"{out_dir}/frame_%03d.jpg"],
-        check=True, capture_output=True
-    )
+    try:
+        subprocess.run(
+            ["ffmpeg", "-i", video_path, "-vf", f"fps={fps}", f"{out_dir}/frame_%03d.jpg"],
+            check=True, capture_output=True
+        )
+    except subprocess.CalledProcessError as e:
+        raise FFmpegExtractionError(str(e)) from e
     return sorted(Path(out_dir).glob("frame_*.jpg"))
 
 def select_frames_covering_full_video(frames, max_frames: int = 30):
@@ -91,7 +98,14 @@ def verify_order(req: VerifyRequest):
                 for chunk in r.iter_bytes():
                     f.write(chunk)
 
-        frames = extract_frames(video_path, tmp)
+                try:
+            frames = extract_frames(video_path, tmp)
+except FFmpegExtractionError:
+            return {
+                "status": "extraction_failed",
+                "result": None,
+                "error": "فشل استخراج إطارات الفيديو تقنياً (ffmpeg)، يحتاج مراجعة يدوية"
+            }
         if not frames:
             return {"status": "error", "reason": "no_frames_extracted"}
 
