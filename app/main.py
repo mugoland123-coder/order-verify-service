@@ -98,9 +98,9 @@ def verify_order(req: VerifyRequest):
                 for chunk in r.iter_bytes():
                     f.write(chunk)
 
-                try:
+        try:
             frames = extract_frames(video_path, tmp)
-except FFmpegExtractionError:
+        except FFmpegExtractionError:
             return {
                 "status": "extraction_failed",
                 "result": None,
