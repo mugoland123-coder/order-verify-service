@@ -126,6 +126,168 @@ def select_frames_covering_full_video(frames, max_frames: int = 30):
         indices[-1] = total - 1
     return [frames[i] for i in indices]
 
+# ---------------------------------------------------------------------------
+# تطبيع رد النموذج قبل إرجاعه للـworkflow.
+# النموذج يخرج أحياناً "ر253" بدل R253، أو وزناً بصيغة "0.250" بلا وحدة،
+# أو اسم منصة بصيغة حرة. هذه الدالة توحّد كل ذلك، وتضمن وجود كل الحقول
+# التي يعتمد عليها n8n حتى لو أغفلها النموذج.
+# ---------------------------------------------------------------------------
+
+_PLATFORM_MAP = {
+    "keeta": "keeta", "كيتا": "keeta",
+    "jahez": "jahez", "جاهز": "jahez",
+    "hunger": "hunger", "hungerstation": "hunger", "هنجر": "hunger",
+    "ninja": "ninja", "نينجا": "ninja",
+    "thechefz": "thechefz", "chefz": "thechefz", "شيفز": "thechefz", "شيقز": "thechefz",
+    "marsool": "marsool", "مرسول": "marsool",
+    "toyou": "toyou", "تويو": "toyou",
+}
+
+_BRANCH_BY_CODE = {
+    "0001": "Al Masiaf", "0002": "Al Wisham", "0003": "Al Khaleej",
+    "0004": "Al Yasmin", "0005": "Dhahrat Laban",
+}
+
+
+def _norm_platform(value):
+    if not value:
+        return "unknown"
+    s = str(value).strip().lower()
+    if s in ("", "not_applicable", "n/a", "none", "null", "unknown"):
+        return "unknown"
+    if s in _PLATFORM_MAP:
+        return _PLATFORM_MAP[s]
+    for key, val in _PLATFORM_MAP.items():
+        if key in s:
+            return val
+    return "unknown"
+
+
+def _norm_branch(value):
+    if value is None or str(value).strip() == "":
+        return None
+    s = str(value).strip()
+    if s.lower() in ("unknown", "n/a", "none", "null"):
+        return None
+    digits = re.sub(r"\D", "", s)
+    if digits and digits.zfill(4) in _BRANCH_BY_CODE:
+        return _BRANCH_BY_CODE[digits.zfill(4)]
+    return s
+
+
+def _num(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    cleaned = re.sub(r"[^0-9.\-]", "", str(value))
+    if cleaned in ("", "-", ".", "-."):
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _norm_code(item):
+    """يقبل code جاهزاً أو يستخرجه من الاسم: R253 · ر253 · (R253) · SKU: R253"""
+    candidate = item.get("code") or ""
+    match = re.search(r"[رR]\s?(\d{1,5})", str(candidate))
+    if not match:
+        match = re.search(r"[رR]\s?(\d{1,5})", str(item.get("name") or ""))
+    return "R" + match.group(1) if match else None
+
+
+def _norm_weight(item):
+    """يوحّد الوزن. القيمة بلا وحدة وأقل من 20 تُعامل كيلوجرام (0.250 = 250g)."""
+    value = _num(item.get("weight_value"))
+    unit = str(item.get("weight_unit") or "").strip().lower()
+    if value is None:
+        match = re.search(
+            r"(\d+(?:\.\d+)?)\s*(kg|g|كجم|كيلو|كغ|جرام|جم|غم)?",
+            str(item.get("weight") or "").replace(" ", ""),
+        )
+        if not match:
+            return None, None
+        value = float(match.group(1))
+        unit = (match.group(2) or "").lower()
+    if unit in ("kg", "كجم", "كيلو", "كغ") or (not unit and value < 20):
+        return round(value, 4), "kg"
+    return round(value, 2), "g"
+
+
+def _clean_name(raw_name):
+    name = re.sub(r"[رR]\s?\d{1,5}", "", str(raw_name or ""))
+    name = re.sub(r"\(\s*\)|\[\s*\]", " ", name)
+    name = re.sub(r"\s*-\s*SKU\s*:?\s*", " ", name, flags=re.IGNORECASE)
+    return re.sub(r"\s{2,}", " ", name).strip(" -–_")
+
+
+_CONF = ("high", "medium", "low")
+
+
+def _norm_conf(value):
+    s = str(value or "").strip().lower()
+    return s if s in _CONF else "low"
+
+
+def normalize_result(parsed):
+    # حالة فشل تفكيك JSON تمر كما هي بلا تعديل — n8n يتعامل معها كفشل تقني.
+    if not isinstance(parsed, dict) or "raw_response" in parsed:
+        return parsed
+
+    items = []
+    for raw_item in (parsed.get("items") or []):
+        if not isinstance(raw_item, dict):
+            continue
+        weight_value, weight_unit = _norm_weight(raw_item)
+        line_total = _num(raw_item.get("line_total"))
+        unit_price = _num(raw_item.get("price"))
+        quantity = _num(raw_item.get("quantity"))
+        quantity = int(quantity) if quantity is not None else None
+        if line_total is None and unit_price is not None:
+            line_total = round(unit_price * (quantity or 1), 2)
+        items.append({
+            "code": _norm_code(raw_item),
+            "name": _clean_name(raw_item.get("name")),
+            "quantity": quantity,
+            "weight_value": weight_value,
+            "weight_unit": weight_unit,
+            "weight": raw_item.get("weight"),
+            "price": unit_price,
+            "line_total": line_total,
+        })
+
+    order_code = parsed.get("order_code")
+    order_code = str(order_code).strip() if order_code not in (None, "", "null") else None
+
+    field_conf = parsed.get("field_confidence") or {}
+    if not isinstance(field_conf, dict):
+        field_conf = {}
+
+    platform = _norm_platform(parsed.get("platform") or parsed.get("order_source_hint"))
+    branch = _norm_branch(parsed.get("branch"))
+    order_total = _num(parsed.get("order_total"))
+
+    return {
+        "order_code": order_code,
+        "platform": platform,
+        "branch": branch,
+        "order_date": parsed.get("order_date") or None,
+        "order_total": order_total,
+        "currency": parsed.get("currency") or "SAR",
+        "items": items,
+        "order_source_hint": parsed.get("order_source_hint") or "not_applicable",
+        "confidence": _norm_conf(parsed.get("confidence")),
+        "field_confidence": {
+            "order_code": _norm_conf(field_conf.get("order_code")) if order_code else "low",
+            "platform": _norm_conf(field_conf.get("platform")) if platform != "unknown" else "low",
+            "branch": _norm_conf(field_conf.get("branch")) if branch else "low",
+            "order_total": _norm_conf(field_conf.get("order_total")) if order_total else "low",
+        },
+    }
+
+
 def analyze_with_claude(image_content_blocks: list[dict], invoice_text: str | None) -> dict:
     """
     دالة تحليل الاستجابة المشتركة بين مسار الفيديو ومسار الصورة الثابتة:
@@ -172,13 +334,48 @@ def analyze_with_claude(image_content_blocks: list[dict], invoice_text: str | No
         "تضع price كـ null لأي صنف، افحص كل إطار مرفق لك بالكامل، واحداً تلو الآخر، بحثاً عن "
         "شاشة تفاصيل الطلب — ولا تكتفِ بفحص أول إطار أو آخر إطار فقط. عدم ظهور شاشة السعر في "
         "الإطارات الأولى لا يعني إطلاقاً عدم وجودها في إطار لاحق.\n\n"
+        "حقول إضافية مطلوبة على مستوى الطلب ككل — استخرجها من شاشة تطبيق التوصيل:\n"
+        "- platform: المنصة التي جاء منها الطلب، من شعار التطبيق أو اسمه الظاهر على الشاشة. "
+        "القيم المسموحة فقط: keeta | jahez | hunger | ninja | thechefz | marsool | toyou | unknown. "
+        "لا تستنتج المنصة من شكل رقم الطلب إطلاقاً — فقط من الشعار أو الاسم الظاهر بالفيديو.\n"
+        "- branch: الفرع أو المخزن الظاهر على الملصق أو الشاشة. القيم المتوقعة: "
+        "Al Masiaf أو Al Wisham أو Al Khaleej أو Al Yasmin أو Dhahrat Laban، أو رمز المخزن "
+        "من 0001 إلى 0005، أو null إن لم يظهر.\n"
+        "- order_date: تاريخ الطلب بصيغة YYYY-MM-DD إن ظهر، وإلا null.\n"
+        "- order_total: الإجمالي النهائي للطلب كما هو مطبوع على شاشة تفاصيل الطلب شاملاً الضريبة، "
+        "رقم فقط بدون رمز العملة. لا تحسبه بنفسك بجمع الأصناف — استخرجه كما هو مطبوع، وضع null "
+        "إن لم يظهر إجمالي واضح.\n\n"
+        "حقول إضافية مطلوبة لكل صنف على حدة:\n"
+        "- code: كود الصنف بصيغة حرف R متبوعاً برقم مثل R253. قد يظهر بالعربية (ر253) أو داخل "
+        "أقواس — طبّعه دائماً إلى الصيغة R253. ضع null إن لم يظهر كود على الملصق.\n"
+        "- quantity: عدد القطع من هذا الصنف كرقم صحيح. انتبه جيداً: الكمية غير الوزن. صنف وزن "
+        "عبوته 250 جرام وعدد قطعه اثنتان يكون quantity = 2 و weight_value = 250. ضع null إن لم "
+        "يظهر العدد.\n"
+        "- weight_value و weight_unit: نفس الوزن المذكور أعلاه لكن مفصولاً — رقم مجرد بلا وحدة "
+        "في weight_value، والوحدة في weight_unit بقيمة g أو kg فقط.\n"
+        "- line_total: إجمالي هذا السطر شاملاً الضريبة. إذا كان الظاهر سعر القطعة الواحدة فقط "
+        "فاضربه في الكمية. ضع null إن تعذّر.\n\n"
+        "وأخيراً field_confidence: درجة ثقتك في كل حقل حرج على حدة (high أو medium أو low). "
+        "أي حقل وضعت قيمته null يجب أن تكون ثقته low.\n\n"
         "أعد النتيجة بصيغة JSON فقط بدون أي نص إضافي، وفق الحقول التالية بالضبط:\n"
         '{"order_code": "الرقم الطويل من شاشة التطبيق، أو null إن لم يظهر", '
-        '"items": [{"name": "اسم/كود الصنف كما يظهر أو وصفه إن لم يتوفر كود", '
+        '"platform": "keeta|jahez|hunger|ninja|thechefz|marsool|toyou|unknown", '
+        '"branch": "اسم الفرع أو رمز المخزن أو null", '
+        '"order_date": "YYYY-MM-DD أو null", '
+        '"order_total": "الإجمالي النهائي كرقم أو null", '
+        '"currency": "SAR", '
+        '"items": [{"code": "R253 أو null", '
+        '"name": "اسم الصنف بدون الكود", '
+        '"quantity": "عدد القطع كرقم أو null", '
+        '"weight_value": "الوزن كرقم مجرد أو null", '
+        '"weight_unit": "g أو kg", '
         '"weight": "الوزن/الحجم من ملصق العبوة أو null", '
-        '"price": "سعر الصنف من شاشة التطبيق أو null"}], '
+        '"price": "سعر الصنف من شاشة التطبيق أو null", '
+        '"line_total": "إجمالي السطر أو null"}], '
         '"order_source_hint": "image_catalog|text_list|mixed|not_applicable", '
-        '"confidence": "high|medium|low"}'
+        '"confidence": "high|medium|low", '
+        '"field_confidence": {"order_code": "high|medium|low", "platform": "high|medium|low", '
+        '"branch": "high|medium|low", "order_total": "high|medium|low"}}'
     )
     if invoice_text:
         prompt += f"\n\nنص الفاتورة المتوقع للمقارنة:\n{invoice_text}"
@@ -187,7 +384,7 @@ def analyze_with_claude(image_content_blocks: list[dict], invoice_text: str | No
 
     msg = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1500,
+        max_tokens=4000,
         messages=[{"role": "user", "content": content}]
     )
 
@@ -202,7 +399,7 @@ def analyze_with_claude(image_content_blocks: list[dict], invoice_text: str | No
     except json.JSONDecodeError:
         parsed = {"raw_response": raw}
 
-    return {"status": "ok", "result": parsed}
+    return {"status": "ok", "result": normalize_result(parsed)}
 
 @app.post("/verify-order")
 def verify_order(req: VerifyRequest):
