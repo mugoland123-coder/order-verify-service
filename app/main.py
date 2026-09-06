@@ -96,35 +96,76 @@ def detect_input_kind(source_url: str, file_path: str) -> tuple[str, str | None]
 
     return "video", None
 
+def probe_duration(video_path: str):
+    """مدة الفيديو بالثواني عبر ffprobe، أو None إن تعذّر."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", video_path],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        d = float(out)
+        return d if d > 0 else None
+    except Exception:
+        return None
+
+
+def frame_timestamps(duration: float, count: int = 40):
+    """
+    توقيتات ثابتة موزّعة بالتساوي على مدة الفيديو: t_i = duration * i / (count + 1)
+    لـ i من 1 إلى count. حتمية تماماً: نفس المدة تعطي نفس التوقيتات دائماً.
+    """
+    return [round(duration * i / (count + 1), 3) for i in range(1, count + 1)]
+
+
+def extract_frames_at(video_path: str, out_dir: str, timestamps):
+    """
+    يستخرج إطاراً واحداً عند كل طابع زمني صريح. الاختيار حتمي ولا يعتمد على
+    معدّل إطارات ولا على ترتيب ملفات، فنفس الفيديو يعطي نفس الإطارات في كل تشغيلة.
+    """
+    frames = []
+    for idx, t in enumerate(timestamps):
+        out = f"{out_dir}/frame_{idx:03d}.jpg"
+        try:
+            subprocess.run(
+                ["ffmpeg", "-nostdin", "-y", "-accurate_seek", "-ss", f"{t:.3f}",
+                 "-i", video_path, "-frames:v", "1", "-q:v", "2", out],
+                check=True, capture_output=True,
+            )
+        except subprocess.CalledProcessError:
+            continue
+        p = Path(out)
+        if p.exists() and p.stat().st_size > 0:
+            frames.append(p)
+    if not frames:
+        raise FFmpegExtractionError("no frames extracted at the requested timestamps")
+    return frames
+
+
 def extract_frames(video_path: str, out_dir: str, fps: float = 3.0):
+    """مسار احتياطي فقط: يُستخدم حين تتعذّر معرفة مدة الفيديو."""
     try:
         subprocess.run(
-            ["ffmpeg", "-i", video_path, "-vf", f"fps={fps}", f"{out_dir}/frame_%03d.jpg"],
+            ["ffmpeg", "-nostdin", "-y", "-i", video_path, "-vf", f"fps={fps}",
+             f"{out_dir}/frame_%03d.jpg"],
             check=True, capture_output=True
         )
     except subprocess.CalledProcessError as e:
         raise FFmpegExtractionError(str(e)) from e
     return sorted(Path(out_dir).glob("frame_*.jpg"))
 
-def select_frames_covering_full_video(frames, max_frames: int = 40):
-    """
-    يرجّع مجموعة إطارات موزّعة بالتساوي على طول الفيديو كاملاً (من أوله إلى
-    آخره)، بدل الاكتفاء بأول N إطار فقط. هذا مهم لأن شاشة تطبيق التوصيل
-    (وبالتالي السعر) قد لا تظهر إلا في جزء متأخر من الفيديو — بعد فتح
-    الطرد مثلاً — وكانت أول 20 إطاراً (أول 20 ثانية فقط عند fps=1) قد
-    تفوّت هذا الجزء تماماً وترجع السعر null رغم وجوده فعلياً بالفيديو.
 
-    إذا كان عدد الإطارات أقل من أو يساوي max_frames، تُرجع كلها كما هي.
-    """
+def select_frames_covering_full_video(frames, max_frames: int = 40):
+    """اختيار متساوي التباعد من قائمة إطارات جاهزة — للمسار الاحتياطي فقط."""
     total = len(frames)
     if total <= max_frames:
         return frames
-
     step = total / max_frames
     indices = sorted({int(i * step) for i in range(max_frames)})
     if indices[-1] != total - 1:
         indices[-1] = total - 1
     return [frames[i] for i in indices]
+
 
 # ---------------------------------------------------------------------------
 # تطبيع رد النموذج قبل إرجاعه للـworkflow.
@@ -580,6 +621,7 @@ def analyze_with_claude(image_content_blocks: list[dict], invoice_text: str | No
     msg = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=6000,
+        temperature=0,
         messages=[{"role": "user", "content": content}]
     )
 
@@ -627,18 +669,24 @@ def verify_order(req: VerifyRequest):
 
         # المسار الحالي لمعالجة الفيديو — بدون أي تغيير في المنطق (ffmpeg
         # يستخرج الإطارات، ثم Claude API يحللها بنفس البرومبت الحالي).
+        duration = probe_duration(input_path)
         try:
-            frames = extract_frames(input_path, tmp)
+            if duration:
+                selected_frames = extract_frames_at(
+                    input_path, tmp, frame_timestamps(duration, 40)
+                )
+            else:
+                selected_frames = select_frames_covering_full_video(
+                    extract_frames(input_path, tmp), max_frames=40
+                )
         except FFmpegExtractionError:
             return {
                 "status": "extraction_failed",
                 "result": None,
                 "error": "فشل استخراج إطارات الفيديو تقنياً (ffmpeg)، يحتاج مراجعة يدوية"
             }
-        if not frames:
+        if not selected_frames:
             return {"status": "error", "reason": "no_frames_extracted"}
-
-        selected_frames = select_frames_covering_full_video(frames, max_frames=40)
 
         content = []
         for fp in selected_frames:
