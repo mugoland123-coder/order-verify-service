@@ -96,7 +96,7 @@ def detect_input_kind(source_url: str, file_path: str) -> tuple[str, str | None]
 
     return "video", None
 
-def extract_frames(video_path: str, out_dir: str, fps: float = 1.0):
+def extract_frames(video_path: str, out_dir: str, fps: float = 3.0):
     try:
         subprocess.run(
             ["ffmpeg", "-i", video_path, "-vf", f"fps={fps}", f"{out_dir}/frame_%03d.jpg"],
@@ -106,7 +106,7 @@ def extract_frames(video_path: str, out_dir: str, fps: float = 1.0):
         raise FFmpegExtractionError(str(e)) from e
     return sorted(Path(out_dir).glob("frame_*.jpg"))
 
-def select_frames_covering_full_video(frames, max_frames: int = 30):
+def select_frames_covering_full_video(frames, max_frames: int = 40):
     """
     يرجّع مجموعة إطارات موزّعة بالتساوي على طول الفيديو كاملاً (من أوله إلى
     آخره)، بدل الاكتفاء بأول N إطار فقط. هذا مهم لأن شاشة تطبيق التوصيل
@@ -240,6 +240,97 @@ def _norm_conf(value):
     return s if s in _CONF else "low"
 
 
+_FULFILL_STATUS = ("matched", "missing", "extra", "weight_diff", "not_seen")
+_COVERAGE = ("full", "partial", "none")
+_VERDICT = ("matched", "mismatch", "not_verifiable")
+_MEDIUM = ("printed_receipt", "app_screen", "unknown")
+
+
+def _norm_invoice_items(raw):
+    """بنود الفاتورة كما قرأها النموذج من الشاشة/الورقة فقط."""
+    out = []
+    for it in (raw or []):
+        if not isinstance(it, dict):
+            continue
+        qty = _num(it.get("quantity"))
+        out.append({
+            "code": _norm_code(it),
+            "name": _clean_name(it.get("name")),
+            "quantity": int(qty) if qty is not None else None,
+            "unit_price": _num(it.get("unit_price") if it.get("unit_price") is not None else it.get("price")),
+            "line_total": _num(it.get("line_total")),
+        })
+    return out
+
+
+def _norm_prepared_items(raw):
+    """العبوات التي رآها النموذج فعلاً. seen_count هو عدد العبوات المرئية، لا كمية الفاتورة."""
+    out = []
+    for it in (raw or []):
+        if not isinstance(it, dict):
+            continue
+        seen = _num(it.get("seen_count"))
+        wv, wu = _norm_weight({
+            "weight_value": it.get("label_weight_value"),
+            "weight_unit": it.get("label_weight_unit"),
+            "weight": it.get("label_weight"),
+        })
+        out.append({
+            "code": _norm_code(it),
+            "name": _clean_name(it.get("name")),
+            "seen_count": int(seen) if seen is not None else None,
+            "label_weight": it.get("label_weight"),
+            "label_weight_g": _grams(wv, wu),
+        })
+    return out
+
+
+def _norm_fulfillment(raw, prepared):
+    """
+    يطبّع حكم التحضير. القاعدة الصارمة: 'missing' اتهام ولا تُقبل إلا مع coverage='full'؛
+    أي شك يُخفَّض إلى 'not_seen'. وإذا لم تُرَ أي عبوة إطلاقاً فالحكم not_verifiable مهما قال النموذج.
+    """
+    raw = raw if isinstance(raw, dict) else {}
+    coverage = str(raw.get("coverage") or "").strip().lower()
+    if coverage not in _COVERAGE:
+        coverage = "none" if not prepared else "partial"
+    if not prepared:
+        coverage = "none"
+
+    lines = []
+    for ln in (raw.get("lines") or []):
+        if not isinstance(ln, dict):
+            continue
+        st = str(ln.get("status") or "").strip().lower()
+        if st not in _FULFILL_STATUS:
+            st = "not_seen"
+        if st == "missing" and coverage != "full":
+            st = "not_seen"
+        lines.append({
+            "code": _norm_code(ln),
+            "status": st,
+            "note": str(ln.get("note") or "").strip() or None,
+        })
+
+    # الحكم يُشتق من السطور بعد تطبيعها، لا يُؤخذ من النموذج كما هو،
+    # حتى لا يبقى حكم "mismatch" قائماً بعد تخفيض سطوره إلى not_seen.
+    hard = [l for l in lines if l["status"] in ("missing", "extra", "weight_diff")]
+    if coverage == "none":
+        verdict = "not_verifiable"
+    elif hard:
+        verdict = "mismatch"
+    elif lines and coverage == "full" and all(l["status"] == "matched" for l in lines):
+        verdict = "matched"
+    else:
+        verdict = "not_verifiable"
+
+    counts = {k: 0 for k in _FULFILL_STATUS}
+    for l in lines:
+        counts[l["status"]] += 1
+
+    return {"coverage": coverage, "verdict": verdict, "lines": lines, "counts": counts}
+
+
 def normalize_result(parsed):
     # حالة فشل تفكيك JSON تمر كما هي بلا تعديل — n8n يتعامل معها كفشل تقني.
     if not isinstance(parsed, dict) or "raw_response" in parsed:
@@ -298,6 +389,21 @@ def normalize_result(parsed):
     branch = _norm_branch(parsed.get("branch"))
     order_total = _num(parsed.get("order_total"))
 
+    medium = str(parsed.get("evidence_medium") or "").strip().lower()
+    if medium not in _MEDIUM:
+        medium = "unknown"
+
+    # شاشة تطبيق تحضير بلا اسم شركة ولا فرع ولا إجمالي مطبوع = هنجر.
+    # يُعلَّم مصدر المنصة حتى يعرف n8n أنها استنتاج من نوع الدليل لا قراءة مباشرة.
+    platform_source = "read" if platform != "unknown" else "none"
+    if platform == "unknown" and medium == "app_screen" and branch is None and order_total is None:
+        platform = "hunger"
+        platform_source = "inferred_medium"
+
+    invoice_items = _norm_invoice_items(parsed.get("invoice_items"))
+    prepared_items = _norm_prepared_items(parsed.get("prepared_items"))
+    fulfillment = _norm_fulfillment(parsed.get("fulfillment"), prepared_items)
+
     return {
         "order_code": order_code,
         "platform": platform,
@@ -306,6 +412,11 @@ def normalize_result(parsed):
         "order_total": order_total,
         "currency": parsed.get("currency") or "SAR",
         "items": items,
+        "evidence_medium": medium,
+        "platform_source": platform_source,
+        "invoice_items": invoice_items,
+        "prepared_items": prepared_items,
+        "fulfillment": fulfillment,
         "order_source_hint": parsed.get("order_source_hint") or "not_applicable",
         "confidence": _norm_conf(parsed.get("confidence")),
         "field_confidence": {
@@ -363,6 +474,14 @@ def analyze_with_claude(image_content_blocks: list[dict], invoice_text: str | No
         "تضع price كـ null لأي صنف، افحص كل إطار مرفق لك بالكامل، واحداً تلو الآخر، بحثاً عن "
         "شاشة تفاصيل الطلب — ولا تكتفِ بفحص أول إطار أو آخر إطار فقط. عدم ظهور شاشة السعر في "
         "الإطارات الأولى لا يعني إطلاقاً عدم وجودها في إطار لاحق.\n\n"
+        "نوع الدليل المصوَّر — حدّده أولاً قبل أي استخراج، وضعه في evidence_medium:\n"
+        "- 'printed_receipt': الفيديو يعرض فاتورة ورقية مطبوعة، فيها عادةً اسم منصة التوصيل واسم الفرع "
+        "وقائمة الأصناف وسطر إجمالي (Total).\n"
+        "- 'app_screen': الفيديو يعرض شاشة تطبيق تحضير الطلبات على جوال أو جهاز لوحي — قائمة طلبات، "
+        "بطاقات منتجات بصور، تبويبات مثل To pick / Picked / Not Found — ولا توجد فاتورة ورقية.\n"
+        "- 'unknown': لا هذا ولا ذاك.\n"
+        "قاعدة إلزامية: إذا كان evidence_medium = 'app_screen' ولم يظهر اسم شركة توصيل ولا اسم فرع ولا "
+        "إجمالي مطبوع للطلب، فالمنصة هي hunger — ضع platform = 'hunger' ولا تضع unknown.\n\n"
         "حقول إضافية مطلوبة على مستوى الطلب ككل — استخرجها من شاشة تطبيق التوصيل:\n"
         "- platform: المنصة التي جاء منها الطلب، من شعار التطبيق أو اسمه الظاهر على الشاشة. "
         "القيم المسموحة فقط: keeta | jahez | hunger | ninja | thechefz | marsool | toyou | unknown. "
@@ -395,6 +514,27 @@ def analyze_with_claude(image_content_blocks: list[dict], invoice_text: str | No
         "'line_total' فانقل الوزن كما هو بلا ضرب. ضع null إن لم يظهر وزن.\n"
         "- line_total: إجمالي هذا السطر شاملاً الضريبة. إذا كان الظاهر سعر القطعة الواحدة فقط "
         "فاضربه في الكمية. ضع null إن تعذّر.\n\n"
+        "مطلوب منك بعد ذلك قائمتان مستقلتان تماماً — لا تدمجهما ولا تدع إحداهما تؤثر في الأخرى:\n"
+        "1) invoice_items — ما طلبه العميل كما هو مكتوب على الفاتورة الورقية أو شاشة تطبيق الطلبات فقط. "
+        "لكل سطر: name كما هو مكتوب، quantity، unit_price، line_total، و code إن كان كود R مطبوعاً على "
+        "الفاتورة نفسها (كثير من الفواتير لا تطبعه — ضع null حينها). لا تأخذ شيئاً هنا من ملصقات العبوات.\n"
+        "2) prepared_items — ما رأيته فعلاً من عبوات مادية محضّرة في الفيديو. لكل صنف رأيت عبوته: code من "
+        "ملصقها، name من ملصقها، seen_count = عدد العبوات المتطابقة التي رأيتها من هذا الصنف، و label_weight "
+        "كما هو مطبوع على الملصق نصياً.\n"
+        "ممنوع منعاً قاطعاً: لا تُدرج في prepared_items أي صنف لم ترَ عبوته فعلاً في إطار من الإطارات، حتى "
+        "لو كان مذكوراً في الفاتورة، وحتى لو كان وجوده منطقياً. prepared_items شهادة بصرية لا استنتاج. "
+        "وبالمقابل، إذا رأيت عبوة لصنف غير مذكور في الفاتورة فأدرجها كما هي.\n"
+        "3) fulfillment — مقارنتك بين القائمتين:\n"
+        "- coverage: 'full' إذا أظهر الفيديو كل العبوات المحضّرة بوضوح يكفي للحكم، 'partial' إذا أظهر "
+        "بعضها فقط، 'none' إذا لم يُظهر أي عبوة بوضوح.\n"
+        "- verdict: 'matched' أو 'mismatch' أو 'not_verifiable'.\n"
+        "- lines: سطر لكل كود ظهر في أي من القائمتين، فيه code و status و note مختصرة. قيم status:\n"
+        "  'matched' موجود بالفاتورة ورأيته محضّراً بنفس العدد والوزن؛ 'missing' بالفاتورة ولم أره وأنا "
+        "واثق لأن الفيديو أظهر كل ما جُهِّز؛ 'extra' رأيت عبوة لصنف ليس بالفاتورة؛ 'weight_diff' موجود في "
+        "الاثنين لكن وزن الملصق يخالف وزن الفاتورة؛ 'not_seen' بالفاتورة ولم أستطع رؤيته بوضوح كافٍ للحكم.\n"
+        "القاعدة الحاسمة: لا تستخدم 'missing' إلا إذا كان coverage = 'full' وكنت متأكداً أن الفيديو عرض كل "
+        "ما جُهِّز. في أي حالة شك استخدم 'not_seen'. الفرق بينهما جوهري: 'missing' اتهام للموظف، "
+        "و'not_seen' اعتراف بأن الصورة لم تكفِ. الاعتراف أفضل من اتهام خاطئ.\n\n"
         "وأخيراً field_confidence: درجة ثقتك في كل حقل حرج على حدة (high أو medium أو low). "
         "أي حقل وضعت قيمته null يجب أن تكون ثقته low.\n\n"
         "أعد النتيجة بصيغة JSON فقط بدون أي نص إضافي، وفق الحقول التالية بالضبط:\n"
@@ -415,19 +555,31 @@ def analyze_with_claude(image_content_blocks: list[dict], invoice_text: str | No
         '"weight": "الوزن/الحجم من ملصق العبوة أو null", '
         '"price": "سعر الصنف من شاشة التطبيق أو null", '
         '"line_total": "إجمالي السطر أو null"}], '
+        '"evidence_medium": "printed_receipt|app_screen|unknown", '
+        '"invoice_items": [{"code": "R253 أو null", "name": "اسم الصنف كما هو مكتوب بالفاتورة", '
+        '"quantity": "عدد أو null", "unit_price": "سعر القطعة أو null", "line_total": "إجمالي السطر أو null"}], '
+        '"prepared_items": [{"code": "كود R من الملصق أو null", "name": "الاسم من الملصق", '
+        '"seen_count": "عدد العبوات التي رأيتها من هذا الصنف", "label_weight": "الوزن المطبوع على الملصق أو null"}], '
+        '"fulfillment": {"coverage": "full|partial|none", "verdict": "matched|mismatch|not_verifiable", '
+        '"lines": [{"code": "...", "status": "matched|missing|extra|weight_diff|not_seen", "note": "سبب مختصر أو null"}]}, '
         '"order_source_hint": "image_catalog|text_list|mixed|not_applicable", '
         '"confidence": "high|medium|low", '
         '"field_confidence": {"order_code": "high|medium|low", "platform": "high|medium|low", '
         '"branch": "high|medium|low", "order_total": "high|medium|low"}}'
     )
     if invoice_text:
-        prompt += f"\n\nنص الفاتورة المتوقع للمقارنة:\n{invoice_text}"
+        prompt += (
+            "\n\nنص فاتورة مرجعية للمقارنة. استخدمه للتحقق من invoice_items فقط. "
+            "يُمنع منعاً قاطعاً استخدامه في بناء prepared_items أو في الحكم على fulfillment — "
+            "هاتان يجب أن تبقيا شهادة بصرية مستقلة عمّا هو مفترض:\n"
+            f"{invoice_text}"
+        )
 
     content.append({"type": "text", "text": prompt})
 
     msg = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=4000,
+        max_tokens=6000,
         messages=[{"role": "user", "content": content}]
     )
 
@@ -486,7 +638,7 @@ def verify_order(req: VerifyRequest):
         if not frames:
             return {"status": "error", "reason": "no_frames_extracted"}
 
-        selected_frames = select_frames_covering_full_video(frames, max_frames=30)
+        selected_frames = select_frames_covering_full_video(frames, max_frames=40)
 
         content = []
         for fp in selected_frames:
@@ -501,3 +653,4 @@ def verify_order(req: VerifyRequest):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
