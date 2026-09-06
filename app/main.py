@@ -216,6 +216,15 @@ def _norm_weight(item):
     return round(value, 2), "g"
 
 
+def _grams(value, unit):
+    """يحوّل (قيمة، وحدة) إلى جرامات، أو None."""
+    if value is None:
+        return None
+    if str(unit or "").strip().lower() == "kg":
+        return round(float(value) * 1000, 2)
+    return round(float(value), 2)
+
+
 def _clean_name(raw_name):
     name = re.sub(r"[رR]\s?\d{1,5}", "", str(raw_name or ""))
     name = re.sub(r"\(\s*\)|\[\s*\]", " ", name)
@@ -247,6 +256,24 @@ def normalize_result(parsed):
         quantity = int(quantity) if quantity is not None else None
         if line_total is None and unit_price is not None:
             line_total = round(unit_price * (quantity or 1), 2)
+
+        basis = str(raw_item.get("weight_basis") or "").strip().lower()
+        if basis not in ("per_unit", "line_total"):
+            basis = None
+
+        total_value, total_unit = _norm_weight({
+            "weight_value": raw_item.get("total_weight_value"),
+            "weight_unit": raw_item.get("total_weight_unit"),
+            "weight": None,
+        })
+        total_weight_g = _grams(total_value, total_unit)
+        unit_weight_g = _grams(weight_value, weight_unit)
+        if total_weight_g is None and unit_weight_g is not None:
+            if basis == "line_total":
+                total_weight_g = unit_weight_g
+            else:
+                total_weight_g = round(unit_weight_g * (quantity or 1), 2)
+
         items.append({
             "code": _norm_code(raw_item),
             "name": _clean_name(raw_item.get("name")),
@@ -254,6 +281,8 @@ def normalize_result(parsed):
             "weight_value": weight_value,
             "weight_unit": weight_unit,
             "weight": raw_item.get("weight"),
+            "weight_basis": basis,
+            "total_weight_g": total_weight_g,
             "price": unit_price,
             "line_total": line_total,
         })
@@ -353,6 +382,17 @@ def analyze_with_claude(image_content_blocks: list[dict], invoice_text: str | No
         "يظهر العدد.\n"
         "- weight_value و weight_unit: نفس الوزن المذكور أعلاه لكن مفصولاً — رقم مجرد بلا وحدة "
         "في weight_value، والوحدة في weight_unit بقيمة g أو kg فقط.\n"
+        "- ربط الوزن بالصنف الصحيح: خذ الوزن من ملصق عبوة هذا الصنف نفسه فقط. إذا ظهرت في "
+        "الفيديو عدة عبوات ولم تجزم بأن الوزن الذي تراه يخص هذا الصنف تحديداً، ضع weight_value "
+        "و total_weight_value بقيمة null. لا تنسب وزن عبوة إلى صنف آخر إطلاقاً، ولا تخمّن وزناً "
+        "من اسم الصنف أو من سعره.\n"
+        "- weight_basis: ماذا يمثل الوزن الذي استخرجته؟ 'per_unit' إذا كان وزن العبوة الواحدة "
+        "من هذا الصنف، أو 'line_total' إذا كان الوزن المطبوع يمثل كامل كمية هذا السطر مجتمعة "
+        "(عبوة واحدة مجمّعة، أو وزن إجمالي مكتوب للسطر). ضع null إن لم يظهر وزن.\n"
+        "- total_weight_value و total_weight_unit: الوزن الإجمالي لهذا السطر بكامل كميته. إذا "
+        "كان weight_basis = 'per_unit' فاضرب وزن العبوة الواحدة في الكمية (مثال: قطعتان وزن "
+        "كل عبوة 200 جرام يعني total_weight_value = 400 و total_weight_unit = g). وإذا كان "
+        "'line_total' فانقل الوزن كما هو بلا ضرب. ضع null إن لم يظهر وزن.\n"
         "- line_total: إجمالي هذا السطر شاملاً الضريبة. إذا كان الظاهر سعر القطعة الواحدة فقط "
         "فاضربه في الكمية. ضع null إن تعذّر.\n\n"
         "وأخيراً field_confidence: درجة ثقتك في كل حقل حرج على حدة (high أو medium أو low). "
@@ -369,6 +409,9 @@ def analyze_with_claude(image_content_blocks: list[dict], invoice_text: str | No
         '"quantity": "عدد القطع كرقم أو null", '
         '"weight_value": "الوزن كرقم مجرد أو null", '
         '"weight_unit": "g أو kg", '
+        '"weight_basis": "per_unit أو line_total أو null", '
+        '"total_weight_value": "الوزن الإجمالي لكامل كمية السطر كرقم أو null", '
+        '"total_weight_unit": "g أو kg", '
         '"weight": "الوزن/الحجم من ملصق العبوة أو null", '
         '"price": "سعر الصنف من شاشة التطبيق أو null", '
         '"line_total": "إجمالي السطر أو null"}], '
