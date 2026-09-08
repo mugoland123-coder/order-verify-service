@@ -304,6 +304,59 @@ def _norm_invoice_items(raw):
     return out
 
 
+def _invoice_sum(rows, total_key="line_total", unit_key="unit_price"):
+    """مجموع بنود قائمة الفاتورة؛ None إذا لم يكن فيها أي سعر."""
+    total = None
+    for it in (rows or []):
+        if not isinstance(it, dict):
+            continue
+        val = _num(it.get(total_key))
+        if val is None:
+            unit = _num(it.get(unit_key))
+            if unit is None:
+                continue
+            qty = _num(it.get("quantity")) or 1
+            val = unit * qty
+        total = val if total is None else total + val
+    return None if total is None else round(total, 2)
+
+
+def _reconcile_invoice_items(invoice_items, items, order_total):
+    """
+    الإجمالي المطبوع على الفاتورة هو المرجع.
+    قائمتا items و invoice_items قراءتان لنفس الفاتورة، وقد تختلفان حين يقرأ
+    النموذج عدداً مختلفاً من أسطر متغيّر الوزن. إن كانت إحداهما تطابق الإجمالي
+    المطبوع والأخرى لا، تُعتمد المطابِقة. قرار حسابي بحت، بلا تخمين.
+    """
+    if order_total is None:
+        return invoice_items, "no_total"
+    sum_inv = _invoice_sum(invoice_items)
+    sum_items = _invoice_sum(items, "line_total", "price")
+    if sum_inv is not None and abs(sum_inv - order_total) <= 0.01:
+        return invoice_items, "ok"
+    if sum_items is None or abs(sum_items - order_total) > 0.01:
+        return invoice_items, "conflict"
+    rebuilt = []
+    for it in (items or []):
+        if not isinstance(it, dict):
+            continue
+        line_total = _num(it.get("line_total"))
+        unit_price = _num(it.get("price"))
+        qty = _num(it.get("quantity"))
+        if line_total is None and unit_price is not None:
+            line_total = round(unit_price * (qty or 1), 2)
+        rebuilt.append({
+            "code": it.get("code"),
+            "name": it.get("name"),
+            "quantity": int(qty) if qty is not None else None,
+            "unit_price": unit_price,
+            "line_total": line_total,
+        })
+    if not rebuilt:
+        return invoice_items, "conflict"
+    return rebuilt, "rebuilt_from_items"
+
+
 def _norm_prepared_items(raw):
     """العبوات التي رآها النموذج فعلاً. seen_count هو عدد العبوات المرئية، لا كمية الفاتورة."""
     out = []
@@ -530,6 +583,8 @@ def normalize_result(parsed):
         [x for x in (parsed.get("invoice_items") or []) if isinstance(x, dict)],
         price_keys=("line_total", "unit_price"),
     ))
+    invoice_items, invoice_sum_check = _reconcile_invoice_items(
+        invoice_items, items, order_total)
     prepared_items = _norm_prepared_items(parsed.get("prepared_items"))
     fulfillment = _norm_fulfillment(parsed.get("fulfillment"), prepared_items)
 
@@ -544,6 +599,7 @@ def normalize_result(parsed):
         "evidence_medium": medium,
         "platform_source": platform_source,
         "invoice_items": invoice_items,
+        "invoice_sum_check": invoice_sum_check,
         "prepared_items": prepared_items,
         "fulfillment": fulfillment,
         "order_source_hint": parsed.get("order_source_hint") or "not_applicable",
@@ -670,6 +726,9 @@ def analyze_with_claude(image_content_blocks: list[dict], invoice_text: str | No
         "1) invoice_items — ما طلبه العميل كما هو مكتوب على الفاتورة الورقية أو شاشة تطبيق الطلبات فقط. "
         "لكل سطر: name كما هو مكتوب، quantity، unit_price، line_total، و code إن كان كود R مطبوعاً على "
         "الفاتورة نفسها (كثير من الفواتير لا تطبعه — ضع null حينها). لا تأخذ شيئاً هنا من ملصقات العبوات.\n"
+        "invoice_items و items قراءتان لنفس الفاتورة: يجب أن تتطابقا بنداً ببند بعد دمج "
+        "أسطر متغيّر الوزن — نفس الأكواد ونفس الأسعار — ومجموع line_total في كلٍّ منهما "
+        "يجب أن يساوي order_total المطبوع. راجع الجمع قبل أن ترد.\n"
         "2) prepared_items — ما رأيته فعلاً من عبوات مادية محضّرة في الفيديو. لكل صنف رأيت عبوته: code من "
         "ملصقها، name من ملصقها، seen_count = عدد العبوات المتطابقة التي رأيتها من هذا الصنف، و label_weight "
         "كما هو مطبوع على الملصق نصياً.\n"
