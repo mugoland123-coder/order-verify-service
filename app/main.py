@@ -372,13 +372,98 @@ def _norm_fulfillment(raw, prepared):
     return {"coverage": coverage, "verdict": verdict, "lines": lines, "counts": counts}
 
 
+_WEIGHT_TOKEN = re.compile(
+    r"\d+(?:[.,]\d+)?\s*(?:g|gm|gr|gram|grams|kg|كجم|كغ|كيلو|جرام|جم|غم)\b", re.I
+)
+_WEIGHT_ONLY = re.compile(
+    r"^[\s\-–·xX×]*\d+(?:[.,]\d+)?\s*(?:g|gm|gr|gram|grams|kg|كجم|كغ|كيلو|جرام|جم|غم)\s*$", re.I
+)
+
+
+def _name_key(value):
+    """اسم مبسّط للمقارنة: بلا كود R ولا أوزان ولا رموز."""
+    txt = re.sub(r"[رR]\s?\d{1,5}", " ", str(value or ""))
+    txt = _WEIGHT_TOKEN.sub(" ", txt)
+    txt = re.sub(r"[^\w\u0600-\u06FF]+", " ", txt, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", txt).strip().lower()
+
+
+def _is_weight_variant_line(prev, cur, code_key, name_key, weight_key, price_keys):
+    """
+    هل السطر الحالي متغيّر وزن للسطر الذي قبله مباشرة، لا صنفاً مستقلاً؟
+    فواتير المنصات تطبع كل منتج بسطرين: سطر علوي بالاسم والكود والسعر الأساسي،
+    وتحته سطر مُزاح فيه الوزن وسعر فرق الوزن. السطران منتج واحد.
+    """
+    if not prev or not cur:
+        return False
+
+    pcode = (prev.get(code_key) or "").strip()
+    ccode = (cur.get(code_key) or "").strip()
+    if ccode and pcode and ccode != pcode:
+        return False
+
+    pname_raw = str(prev.get(name_key) or "")
+    cname_raw = str(cur.get(name_key) or "")
+    pname, cname = _name_key(pname_raw), _name_key(cname_raw)
+
+    # العلامة الحاسمة: السطر السفلي يذكر وزناً والعلوي لا يذكره — هذا متغيّر وزن لا تكرار
+    variant_signal = bool(_WEIGHT_TOKEN.search(cname_raw)) and not bool(_WEIGHT_TOKEN.search(pname_raw))
+
+    # تكرار حقيقي لا متغيّر وزن: سطران متطابقان تماماً بلا علامة الوزن — قطعتان مستقلتان
+    same_weight = str(prev.get(weight_key) or "") == str(cur.get(weight_key) or "")
+    same_price = all(_num(prev.get(k)) == _num(cur.get(k)) for k in price_keys)
+    if pname == cname and same_weight and same_price and not variant_signal:
+        return False
+
+    if ccode and pcode and ccode == pcode:
+        return True
+    if ccode and not pcode:
+        # الكود ظهر على السطر السفلي وحده: يُدمج فقط بدليل قوي (وزن + تطابق اسم)
+        return bool(variant_signal and pname and cname and (cname in pname or pname in cname))
+    # السطر السفلي بلا كود: يُربط بالتجاور والتطابق الجزئي بالاسم أو بكونه وزناً فقط
+    if not cname:
+        return True
+    if _WEIGHT_ONLY.match(cname_raw.strip()):
+        return True
+    if pname and cname and (cname in pname or pname in cname):
+        return True
+    return False
+
+
+def _merge_weight_variant_lines(rows, code_key="code", name_key="name",
+                                weight_key="weight", price_keys=("line_total", "price")):
+    """يدمج كل سطر متغيّر وزن مع السطر الذي قبله: الاسم من الأعلى، الوزن من الأسفل، والسعر مجموعهما."""
+    merged = []
+    for cur in rows:
+        prev = merged[-1] if merged else None
+        if not _is_weight_variant_line(prev, cur, code_key, name_key, weight_key, price_keys):
+            merged.append(dict(cur))
+            continue
+        for k in price_keys:
+            a, b = _num(prev.get(k)), _num(cur.get(k))
+            if a is None and b is None:
+                continue
+            prev[k] = round((a or 0) + (b or 0), 2)
+        if not (prev.get(code_key) or "").strip() and (cur.get(code_key) or "").strip():
+            prev[code_key] = cur[code_key]
+        for k in (weight_key, "weight_value", "weight_unit", "total_weight_value",
+                  "total_weight_unit", "weight_basis"):
+            if cur.get(k) not in (None, "") and k in cur:
+                prev[k] = cur[k]
+        prev["_merged_variant"] = True
+    return merged
+
+
 def normalize_result(parsed):
     # حالة فشل تفكيك JSON تمر كما هي بلا تعديل — n8n يتعامل معها كفشل تقني.
     if not isinstance(parsed, dict) or "raw_response" in parsed:
         return parsed
 
     items = []
-    for raw_item in (parsed.get("items") or []):
+    raw_items = _merge_weight_variant_lines(
+        [x for x in (parsed.get("items") or []) if isinstance(x, dict)]
+    )
+    for raw_item in raw_items:
         if not isinstance(raw_item, dict):
             continue
         weight_value, weight_unit = _norm_weight(raw_item)
@@ -441,7 +526,10 @@ def normalize_result(parsed):
         platform = "hunger"
         platform_source = "inferred_medium"
 
-    invoice_items = _norm_invoice_items(parsed.get("invoice_items"))
+    invoice_items = _norm_invoice_items(_merge_weight_variant_lines(
+        [x for x in (parsed.get("invoice_items") or []) if isinstance(x, dict)],
+        price_keys=("line_total", "unit_price"),
+    ))
     prepared_items = _norm_prepared_items(parsed.get("prepared_items"))
     fulfillment = _norm_fulfillment(parsed.get("fulfillment"), prepared_items)
 
@@ -555,6 +643,29 @@ def analyze_with_claude(image_content_blocks: list[dict], invoice_text: str | No
         "'line_total' فانقل الوزن كما هو بلا ضرب. ضع null إن لم يظهر وزن.\n"
         "- line_total: إجمالي هذا السطر شاملاً الضريبة. إذا كان الظاهر سعر القطعة الواحدة فقط "
         "فاضربه في الكمية. ضع null إن تعذّر.\n\n"
+        "بنية السطرين للصنف الواحد في فواتير المنصات (جاهز/كيتا/بلند) — انتبه لها جيداً:\n"
+        "كل منتج يُطبع على سطرين متتاليين: سطر علوي بارز فيه العدد واسم المنتج وكود R وسعر أساسي، "
+        "وتحته مباشرة سطر مُزاح للداخل يحمل متغيّر الوزن (500g أو 250g أو 1kg…) وسعر فرق الوزن. "
+        "السطران منتج واحد لا منتجان، والسعر الفعلي للصنف = مجموع سعري السطرين.\n"
+        "مثال حقيقي من فاتورة جاهز ترويستها '3 Items' ومجموعها 134.92:\n"
+        "  1X Japanese Mixed Nuts R76          29.98\n"
+        "     1X Japanese mixed nuts R76 500g  29.98   <- نفس الصنف، فرق وزن\n"
+        "  1X Japanese Nuts R514               29.98\n"
+        "     1X 500g Japanese nuts R514       29.98   <- الوزن قبل الاسم هنا\n"
+        "  1X Natural Plant Sugar R138         15.00\n"
+        "     1X Natural Plant Sugar 250g       0.00   <- فرق الوزن صفر\n"
+        "النتيجة الصحيحة ثلاثة أصناف: R76 بـ59.96 و R514 بـ59.96 و R138 بـ15.00، ومجموعها 134.92.\n"
+        "القواعد:\n"
+        "- ادمج السطرين في عنصر واحد: الاسم من السطر العلوي، والوزن من السطر السفلي، والسعر مجموع السعرين.\n"
+        "- إذا كان سعر السطر السفلي 0.00 فالسعر النهائي هو سعر السطر العلوي وحده.\n"
+        "- لا تعتمد على كود R وحده للربط: بعض الأسطر السفلية لا تحمل الكود إطلاقاً، وبعضها يضع الوزن "
+        "قبل الاسم. اعتمد أيضاً على التجاور (السطر التالي مباشرة والمُزاح للداخل) وعلى التطابق الجزئي بالاسم.\n"
+        "- لا تُنشئ عنصرين منفصلين، ولا تُسقط السطر السفلي، ولا تعدّه كمية إضافية.\n"
+        "- سطر 'N Items' أعلى القائمة يساوي عدد الأصناف بعد الدمج — استخدمه للتحقق من عددها.\n"
+        "- تحقّق أخيراً: مجموع أسعار الأصناف بعد الدمج يجب أن يساوي SubTotal/Total المطبوع. إن لم يساوِه "
+        "فراجع الدمج قبل إخراج النتيجة.\n"
+        "- استثناء: سطران متطابقان تماماً (نفس الاسم ونفس الوزن ونفس السعر) هما قطعتان مستقلتان من "
+        "الصنف نفسه، لا متغيّر وزن — اجمع كميتهما ولا تعاملهما معاملة السطرين أعلاه.\n\n"
         "مطلوب منك بعد ذلك قائمتان مستقلتان تماماً — لا تدمجهما ولا تدع إحداهما تؤثر في الأخرى:\n"
         "1) invoice_items — ما طلبه العميل كما هو مكتوب على الفاتورة الورقية أو شاشة تطبيق الطلبات فقط. "
         "لكل سطر: name كما هو مكتوب، quantity، unit_price، line_total، و code إن كان كود R مطبوعاً على "
