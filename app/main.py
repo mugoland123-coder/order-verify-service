@@ -357,6 +357,88 @@ def _reconcile_invoice_items(invoice_items, items, order_total):
     return rebuilt, "rebuilt_from_items"
 
 
+# أطوال أرقام الطلبات المعروفة لكل منصة، مقاسة على الاستخراجات المخزّنة.
+# المنصات غير المذكورة هنا لا يُفحص طول رقم طلبها إطلاقاً.
+_ORDER_CODE_LEN = {"hunger": (10,), "keeta": (16,), "ninja": (9,), "jahez": (10,)}
+
+# سماحية مطابقة مجموع البنود مع الإجمالي المطبوع (ريال).
+_SELF_CHECK_TOL = 0.05
+
+
+def _self_check(order_code, platform, order_total, items, invoice_sum_check, field_conf):
+    """
+    فحص ذاتي حسابي بحت على القراءة نفسها — لا يحكم على الطلب ولا على الموظف،
+    بل يقول: هل هذه القراءة موثوقة بما يكفي لتُقارَن بفاتورة سماك؟
+    كل فحص يُرجع {id, ok, detail}. passed = False إذا سقط أي فحص واحد.
+    """
+    checks = []
+
+    def add(cid, ok, detail=""):
+        checks.append({"id": cid, "ok": bool(ok), "detail": detail if not ok else ""})
+
+    # 1) الإجمالي المطبوع مقروء
+    add("total_read", order_total is not None, "لم يُقرأ إجمالي الطلب")
+
+    # 2) مجموع أسطر البنود = الإجمالي المطبوع
+    priced = [i for i in items if _num(i.get("line_total")) is not None]
+    if order_total is None:
+        add("sum_matches_total", False, "لا إجمالي مطبوع للمقارنة")
+    elif not priced:
+        add("sum_matches_total", False, "لا سعر مقروء لأي بند")
+    else:
+        line_sum = round(sum(_num(i.get("line_total")) for i in priced), 2)
+        diff = round(abs(line_sum - order_total), 2)
+        add("sum_matches_total", diff <= _SELF_CHECK_TOL,
+            "مجموع البنود %s لا يساوي الإجمالي %s (فارق %s)" % (line_sum, order_total, diff))
+
+    # 3) قُرئ سعر بند واحد على الأقل
+    add("any_price", bool(priced), "لم يُقرأ سعر أي بند")
+
+    # 4) كل بند يحمل كود R
+    if not items:
+        add("all_codes", False, "لم يُقرأ أي بند")
+    else:
+        no_code = [i for i in items if not i.get("code")]
+        add("all_codes", not no_code, "%d بند بلا كود R" % len(no_code))
+
+    # 5) كل بند له وزن إجمالي مقروء
+    if not items:
+        add("all_weights", False, "لم يُقرأ أي بند")
+    else:
+        no_weight = [i for i in items if i.get("total_weight_g") is None]
+        add("all_weights", not no_weight,
+            "بنود بلا وزن: " + "، ".join((i.get("code") or i.get("name") or "?") for i in no_weight))
+
+    # 6) طول رقم الطلب مطابق لطول المنصة المعروف
+    lens = _ORDER_CODE_LEN.get(platform)
+    if order_code and lens:
+        digits = re.sub(r"\D", "", str(order_code))
+        add("order_code_len", len(digits) in lens,
+            "رقم الطلب %s طوله %d والمتوقع %s" % (order_code, len(digits),
+                                                  "/".join(str(n) for n in lens)))
+    else:
+        # لا رقم طلب، أو منصة بلا طول معروف — لا شيء يمكن فحصه، فلا يسقط الفحص.
+        add("order_code_len", True)
+
+    # 7) ثقة النموذج في الإجمالي = high
+    add("total_confidence",
+        order_total is not None and _norm_conf(field_conf.get("order_total")) == "high",
+        "ثقة الإجمالي %s وليست high" % _norm_conf(field_conf.get("order_total")))
+
+    # 8) قائمتا الفاتورة (items و invoice_items) تتفقان مع الإجمالي المطبوع
+    add("invoice_lists_agree", invoice_sum_check != "conflict",
+        "قائمتا الفاتورة لا تتفقان مع الإجمالي المطبوع")
+
+    failed = [c["id"] for c in checks if not c["ok"]]
+    return {
+        "passed": not failed,
+        "failed": failed,
+        "checks": checks,
+        "summary": "سليم" if not failed
+                   else " | ".join((c["detail"] or c["id"]) for c in checks if not c["ok"]),
+    }
+
+
 def _norm_prepared_items(raw):
     """العبوات التي رآها النموذج فعلاً. seen_count هو عدد العبوات المرئية، لا كمية الفاتورة."""
     out = []
@@ -588,6 +670,13 @@ def normalize_result(parsed):
     prepared_items = _norm_prepared_items(parsed.get("prepared_items"))
     fulfillment = _norm_fulfillment(parsed.get("fulfillment"), prepared_items)
 
+    field_confidence = {
+        "order_code": _norm_conf(field_conf.get("order_code")) if order_code else "low",
+        "platform": _norm_conf(field_conf.get("platform")) if platform != "unknown" else "low",
+        "branch": _norm_conf(field_conf.get("branch")) if branch else "low",
+        "order_total": _norm_conf(field_conf.get("order_total")) if order_total else "low",
+    }
+
     return {
         "order_code": order_code,
         "platform": platform,
@@ -604,12 +693,9 @@ def normalize_result(parsed):
         "fulfillment": fulfillment,
         "order_source_hint": parsed.get("order_source_hint") or "not_applicable",
         "confidence": _norm_conf(parsed.get("confidence")),
-        "field_confidence": {
-            "order_code": _norm_conf(field_conf.get("order_code")) if order_code else "low",
-            "platform": _norm_conf(field_conf.get("platform")) if platform != "unknown" else "low",
-            "branch": _norm_conf(field_conf.get("branch")) if branch else "low",
-            "order_total": _norm_conf(field_conf.get("order_total")) if order_total else "low",
-        },
+        "field_confidence": field_confidence,
+        "self_check": _self_check(order_code, platform, order_total, items,
+                                  invoice_sum_check, field_confidence),
     }
 
 
