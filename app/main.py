@@ -1,4 +1,4 @@
-import os, re, subprocess, tempfile, base64, json
+import os, re, subprocess, tempfile, base64, json, difflib
 from pathlib import Path
 import httpx
 from fastapi import FastAPI
@@ -359,16 +359,19 @@ def _reconcile_invoice_items(invoice_items, items, order_total):
 
 # أطوال أرقام الطلبات المعروفة لكل منصة، مقاسة على الاستخراجات المخزّنة.
 # المنصات غير المذكورة هنا لا يُفحص طول رقم طلبها إطلاقاً.
-_ORDER_CODE_LEN = {"hunger": (10,), "keeta": (16,), "ninja": (9,), "jahez": (10,)}
+_ORDER_CODE_LEN = {"hunger": (10,), "keeta": (16,), "ninja": (9,), "jahez": (10,),
+                   "thechefz": (9,)}
 
 # سماحية مطابقة مجموع البنود مع الإجمالي المطبوع (ريال).
 _SELF_CHECK_TOL = 0.05
 
 
-def _self_check(order_code, platform, order_total, items, invoice_sum_check, field_conf):
+def _self_check(order_code, platform, reference, ref_basis, products,
+                items_count, merge_notes, invoice_sum_check, field_conf):
     """
     فحص ذاتي حسابي بحت على القراءة نفسها — لا يحكم على الطلب ولا على الموظف،
     بل يقول: هل هذه القراءة موثوقة بما يكفي لتُقارَن بفاتورة سماك؟
+    المرجع هو SubTotal المطبوع، أو Total ناقص التوصيل المطبوع. التوصيل لا يدخل أي مجموع.
     كل فحص يُرجع {id, ok, detail}. passed = False إذا سقط أي فحص واحد.
     """
     checks = []
@@ -376,38 +379,41 @@ def _self_check(order_code, platform, order_total, items, invoice_sum_check, fie
     def add(cid, ok, detail=""):
         checks.append({"id": cid, "ok": bool(ok), "detail": detail if not ok else ""})
 
-    # 1) الإجمالي المطبوع مقروء
-    add("total_read", order_total is not None, "لم يُقرأ إجمالي الطلب")
+    ref_label = _REF_LABEL.get(ref_basis, "المرجع المطبوع")
 
-    # 2) مجموع أسطر البنود = الإجمالي المطبوع
-    priced = [i for i in items if _num(i.get("line_total")) is not None]
-    if order_total is None:
-        add("sum_matches_total", False, "لا إجمالي مطبوع للمقارنة")
+    # 1) مرجع أسعار المنتجات مقروء (SubTotal، أو Total ناقص التوصيل)
+    add("total_read", reference is not None,
+        "لم يُقرأ مرجع أسعار المنتجات: لا SubTotal مطبوع، والتوصيل غير مقروء لخصمه من Total")
+
+    # 2) مجموع أسعار المنتجات = المرجع المطبوع
+    priced = [p for p in products if _num(p.get("line_total")) is not None]
+    if reference is None:
+        add("sum_matches_total", False, "لا مرجع مطبوع للمقارنة")
     elif not priced:
         add("sum_matches_total", False, "لا سعر مقروء لأي بند")
     else:
-        line_sum = round(sum(_num(i.get("line_total")) for i in priced), 2)
-        diff = round(abs(line_sum - order_total), 2)
+        line_sum = round(sum(_num(p.get("line_total")) for p in priced), 2)
+        diff = round(abs(line_sum - reference), 2)
         add("sum_matches_total", diff <= _SELF_CHECK_TOL,
-            "مجموع البنود %s لا يساوي الإجمالي %s (فارق %s)" % (line_sum, order_total, diff))
+            "مجموع المنتجات %s لا يساوي %s %s (فارق %s)" % (line_sum, ref_label, reference, diff))
 
     # 3) قُرئ سعر بند واحد على الأقل
     add("any_price", bool(priced), "لم يُقرأ سعر أي بند")
 
-    # 4) كل بند يحمل كود R
-    if not items:
+    # 4) كل منتج يحمل كود R
+    if not products:
         add("all_codes", False, "لم يُقرأ أي بند")
     else:
-        no_code = [i for i in items if not i.get("code")]
+        no_code = [p for p in products if not p.get("code")]
         add("all_codes", not no_code, "%d بند بلا كود R" % len(no_code))
 
-    # 5) كل بند له وزن إجمالي مقروء
-    if not items:
+    # 5) كل منتج له وزن إجمالي مقروء
+    if not products:
         add("all_weights", False, "لم يُقرأ أي بند")
     else:
-        no_weight = [i for i in items if i.get("total_weight_g") is None]
+        no_weight = [p for p in products if p.get("total_weight_g") is None]
         add("all_weights", not no_weight,
-            "بنود بلا وزن: " + "، ".join((i.get("code") or i.get("name") or "?") for i in no_weight))
+            "بنود بلا وزن: " + "، ".join((p.get("code") or p.get("name") or "?") for p in no_weight))
 
     # 6) طول رقم الطلب مطابق لطول المنصة المعروف
     lens = _ORDER_CODE_LEN.get(platform)
@@ -422,12 +428,22 @@ def _self_check(order_code, platform, order_total, items, invoice_sum_check, fie
 
     # 7) ثقة النموذج في الإجمالي = high
     add("total_confidence",
-        order_total is not None and _norm_conf(field_conf.get("order_total")) == "high",
+        reference is not None and _norm_conf(field_conf.get("order_total")) == "high",
         "ثقة الإجمالي %s وليست high" % _norm_conf(field_conf.get("order_total")))
 
-    # 8) قائمتا الفاتورة (items و invoice_items) تتفقان مع الإجمالي المطبوع
+    # 8) القائمتان تتفقان مع المرجع المطبوع
     add("invoice_lists_agree", invoice_sum_check != "conflict",
-        "قائمتا الفاتورة لا تتفقان مع الإجمالي المطبوع")
+        "قائمتا الفاتورة لا تتفقان مع المرجع المطبوع")
+
+    # 9) كل سطر طُبع أُسند إلى منتجه بلا لبس (لا سطر متغيّر وزن معلّق)
+    add("lines_merged_cleanly", not merge_notes, " ؛ ".join(merge_notes[:3]))
+
+    # 10) عدد المنتجات بعد الدمج = «N Items» المطبوع (يُتخطى وحده إن لم يُقرأ العدد)
+    if items_count is None:
+        add("items_count_match", True)
+    else:
+        add("items_count_match", int(items_count) == len(products),
+            "عدد المنتجات بعد الدمج %d لا يساوي العدد المطبوع %d" % (len(products), int(items_count)))
 
     failed = [c["id"] for c in checks if not c["ok"]]
     return {
@@ -522,71 +538,212 @@ def _name_key(value):
     txt = re.sub(r"[^\w\u0600-\u06FF]+", " ", txt, flags=re.UNICODE)
     return re.sub(r"\s+", " ", txt).strip().lower()
 
+_REF_LABEL = {
+    "subtotal": "SubTotal المطبوع",
+    "total_minus_delivery": "Total ناقص التوصيل",
+    "total_no_delivery_line": "Total المطبوع (بلا سطر توصيل)",
+}
 
-def _is_weight_variant_line(prev, cur, code_key, name_key, weight_key, price_keys):
-    """
-    هل السطر الحالي متغيّر وزن للسطر الذي قبله مباشرة، لا صنفاً مستقلاً؟
-    فواتير المنصات تطبع كل منتج بسطرين: سطر علوي بالاسم والكود والسعر الأساسي،
-    وتحته سطر مُزاح فيه الوزن وسعر فرق الوزن. السطران منتج واحد.
-    """
-    if not prev or not cur:
-        return False
+# الحد الأدنى لتشابه الاسم بين السطر العلوي وسطر خيار الوزن.
+_NAME_SIM_MIN = 0.85
 
-    pcode = (prev.get(code_key) or "").strip()
-    ccode = (cur.get(code_key) or "").strip()
+
+def _name_sim(a, b):
+    """تشابه اسمين بعد التطبيع: حروف صغيرة، بلا كود R ولا وزن ولا رموز، وبلا مسافات."""
+    ka, kb = _name_key(a), _name_key(b)
+    if not ka or not kb:
+        return 0.0
+    sa, sb = ka.replace(" ", ""), kb.replace(" ", "")
+    return round(max(difflib.SequenceMatcher(None, ka, kb).ratio(),
+                     difflib.SequenceMatcher(None, sa, sb).ratio()), 3)
+
+
+def _has_weight_token(line):
+    for key in ("raw_name", "name", "weight", "raw_text"):
+        if _WEIGHT_TOKEN.search(str(line.get(key) or "")):
+            return True
+    return line.get("weight_value") is not None
+
+
+def _norm_raw_line(raw):
+    """سطر مطبوع كما نسخه النموذج: بلا دمج، بلا ضرب، بلا تفسير."""
+    if not isinstance(raw, dict):
+        return None
+    qty = _num(raw.get("qty") if raw.get("qty") is not None else raw.get("quantity"))
+    value, unit = _norm_weight(raw)
+    price = _num(raw.get("price"))
+    if price is None:
+        price = _num(raw.get("line_total"))
+    return {
+        "qty": int(qty) if qty is not None else None,
+        "name": _clean_name(raw.get("name")),
+        "raw_name": str(raw.get("name") or ""),
+        "code": _norm_code(raw),
+        "weight_value": value,
+        "weight_unit": unit,
+        "weight": raw.get("weight"),
+        "price": price,
+        "raw_text": str(raw.get("raw_text") or "").strip()[:160],
+    }
+
+
+def _line_label(line):
+    txt = line.get("raw_text") or line.get("raw_name") or line.get("name") or "?"
+    return str(txt)[:60]
+
+
+def _bottom_verdict(top, cur):
+    """
+    هل السطر الحالي خيار وزن للمنتج الذي فوقه، أم منتج مستقل؟
+    القاعدة: كوده فارغ أو نفس كود العلوي + تطابق الاسم ≥ 0.85 + كميته 1X.
+    كود مختلف = منتج جديد قطعاً.
+    """
+    ccode, pcode = cur.get("code"), top.get("code")
     if ccode and pcode and ccode != pcode:
-        return False
-
-    pname_raw = str(prev.get(name_key) or "")
-    cname_raw = str(cur.get(name_key) or "")
-    pname, cname = _name_key(pname_raw), _name_key(cname_raw)
-
-    # العلامة الحاسمة: السطر السفلي يذكر وزناً والعلوي لا يذكره — هذا متغيّر وزن لا تكرار
-    variant_signal = bool(_WEIGHT_TOKEN.search(cname_raw)) and not bool(_WEIGHT_TOKEN.search(pname_raw))
-
-    # تكرار حقيقي لا متغيّر وزن: سطران متطابقان تماماً بلا علامة الوزن — قطعتان مستقلتان
-    same_weight = str(prev.get(weight_key) or "") == str(cur.get(weight_key) or "")
-    same_price = all(_num(prev.get(k)) == _num(cur.get(k)) for k in price_keys)
-    if pname == cname and same_weight and same_price and not variant_signal:
-        return False
-
-    if ccode and pcode and ccode == pcode:
-        return True
-    if ccode and not pcode:
-        # الكود ظهر على السطر السفلي وحده: يُدمج فقط بدليل قوي (وزن + تطابق اسم)
-        return bool(variant_signal and pname and cname and (cname in pname or pname in cname))
-    # السطر السفلي بلا كود: يُربط بالتجاور والتطابق الجزئي بالاسم أو بكونه وزناً فقط
-    if not cname:
-        return True
-    if _WEIGHT_ONLY.match(cname_raw.strip()):
-        return True
-    if pname and cname and (cname in pname or pname in cname):
-        return True
-    return False
+        return "product", ""
+    # استثناء: سطران علويان متطابقان تماماً (نفس الكود ونفس الوزن ونفس السعر)
+    # هما حبتان مستقلتان من الصنف نفسه، لا سطر خيار وزن.
+    same_weight = (top.get("weight_value") == cur.get("weight_value")
+                   and str(top.get("weight_unit") or "") == str(cur.get("weight_unit") or ""))
+    same_price = _num(top.get("price")) == _num(cur.get("price"))
+    if ccode and pcode and ccode == pcode and same_weight and same_price:
+        return "product", ""
+    sim = _name_sim(top.get("raw_name") or top.get("name"),
+                    cur.get("raw_name") or cur.get("name"))
+    qty_ok = cur.get("qty") in (None, 1)
+    if sim >= _NAME_SIM_MIN:
+        if qty_ok:
+            return "merge", ""
+        return "note", ("سطر خيار وزن كميته %s وليست 1X فلم يُدمج: «%s»"
+                        % (cur.get("qty"), _line_label(cur)))
+    if qty_ok and _has_weight_token(cur) and not _has_weight_token(top):
+        return "merge_if_money", (
+            "سطر وزن تشابه اسمه %.2f أقل من %.2f — لم يُدمج إلا بتأكيد المبلغ المطبوع: «%s»"
+            % (sim, _NAME_SIM_MIN, _line_label(cur)))
+    if not ccode:
+        return "note", ("سطر بلا كود R ولا يطابق اسم المنتج فوقه (تشابه %.2f): «%s»"
+                        % (sim, _line_label(cur)))
+    return "product", ""
 
 
-def _merge_weight_variant_lines(rows, code_key="code", name_key="name",
-                                weight_key="weight", price_keys=("line_total", "price")):
-    """يدمج كل سطر متغيّر وزن مع السطر الذي قبله: الاسم من الأعلى، الوزن من الأسفل، والسعر مجموعهما."""
-    merged = []
-    for cur in rows:
-        prev = merged[-1] if merged else None
-        if not _is_weight_variant_line(prev, cur, code_key, name_key, weight_key, price_keys):
-            merged.append(dict(cur))
-            continue
-        for k in price_keys:
-            a, b = _num(prev.get(k)), _num(cur.get(k))
-            if a is None and b is None:
-                continue
-            prev[k] = round((a or 0) + (b or 0), 2)
-        if not (prev.get(code_key) or "").strip() and (cur.get(code_key) or "").strip():
-            prev[code_key] = cur[code_key]
-        for k in (weight_key, "weight_value", "weight_unit", "total_weight_value",
-                  "total_weight_unit", "weight_basis"):
-            if cur.get(k) not in (None, "") and k in cur:
-                prev[k] = cur[k]
-        prev["_merged_variant"] = True
-    return merged
+def _finalize_product(top, bottom, notes):
+    """سعر الحبة = العلوي + سطر الوزن. السعر الكلي = الكمية × سعر الحبة.
+    الوزن الكلي = الكمية × وزن سطر الوزن. الكمية من السطر العلوي فقط."""
+    qty = top.get("qty")
+    if qty is None:
+        qty = 1
+        notes.append("كمية السطر العلوي غير مقروءة فاعتُبرت 1: «%s»" % _line_label(top))
+    unit_top = top.get("price")
+    unit_bottom = bottom.get("price") if bottom else None
+    if unit_top is None and unit_bottom is None:
+        unit_price = None
+    else:
+        unit_price = round((unit_top or 0) + (unit_bottom or 0), 2)
+    line_total = None if unit_price is None else round(unit_price * qty, 2)
+
+    src, src_kind = None, None
+    if bottom is not None and bottom.get("weight_value") is not None:
+        src, src_kind = bottom, "weight_line"
+    elif bottom is None and top.get("weight_value") is not None:
+        src, src_kind = top, "top_line"
+    unit_weight_g = _grams(src.get("weight_value"), src.get("weight_unit")) if src else None
+    total_weight_g = None if unit_weight_g is None else round(unit_weight_g * qty, 2)
+
+    return {
+        "code": top.get("code") or ((bottom or {}).get("code") if bottom else None),
+        "name": top.get("name"),
+        "quantity": qty,
+        "weight_value": (src or {}).get("weight_value"),
+        "weight_unit": (src or {}).get("weight_unit"),
+        "weight": (src or {}).get("weight"),
+        "weight_basis": "per_unit" if unit_weight_g is not None else None,
+        "total_weight_g": total_weight_g,
+        "price": unit_price,
+        "line_total": line_total,
+        "unit_price_top": unit_top,
+        "unit_price_weight_line": unit_bottom,
+        "merged_weight_line": bottom is not None,
+        "weight_source": src_kind,
+    }
+
+
+def _assemble_products(lines, reference):
+    """
+    يبني المنتجات من السطور المطبوعة حسب قواعد صاحبة النظام.
+    السطر الذي يُرفض دمجه يصبح منتجاً مستقلاً ويُسجَّل سببه في merge_notes.
+    الدمج الاحتياطي (تشابه اسم أقل من الحد) لا يُقبل إلا إذا جعل مجموع المنتجات
+    يساوي المرجع المطبوع — قرار حسابي، لا تخمين.
+    """
+    plan, notes = [], []
+    i, n = 0, len(lines)
+    while i < n:
+        bottom_idx, tentative = None, False
+        if i + 1 < n:
+            verdict, note = _bottom_verdict(lines[i], lines[i + 1])
+            if verdict == "merge":
+                bottom_idx = i + 1
+            elif verdict == "merge_if_money":
+                bottom_idx, tentative = i + 1, True
+                notes.append(note)
+            elif verdict == "note":
+                notes.append(note)
+        plan.append((i, bottom_idx, tentative))
+        i = (bottom_idx + 1) if bottom_idx is not None else (i + 1)
+
+    def build(apply_tentative):
+        local, prods = [], []
+        for top_i, bot_i, tent in plan:
+            use_bottom = bot_i is not None and (apply_tentative or not tent)
+            prods.append(_finalize_product(lines[top_i], lines[bot_i] if use_bottom else None, local))
+            if bot_i is not None and not use_bottom:
+                prods.append(_finalize_product(lines[bot_i], None, local))
+        return prods, local
+
+    prods_with, notes_with = build(True)
+    if not any(t for _, _, t in plan):
+        return prods_with, notes + notes_with
+
+    prods_without, notes_without = build(False)
+
+    def total_of(rows):
+        vals = [_num(p.get("line_total")) for p in rows if _num(p.get("line_total")) is not None]
+        return round(sum(vals), 2) if vals else None
+
+    if reference is not None:
+        t_with, t_without = total_of(prods_with), total_of(prods_without)
+        if t_with is not None and abs(t_with - reference) <= _SELF_CHECK_TOL:
+            kept = [x for x in notes if "لم يُدمج إلا بتأكيد المبلغ المطبوع" not in x]
+            return prods_with, kept + notes_with
+        if t_without is not None and abs(t_without - reference) <= _SELF_CHECK_TOL:
+            return prods_without, notes + notes_without
+    return prods_without, notes + notes_without
+
+
+def _reference_sum(subtotal, delivery, delivery_printed, total):
+    """مرجع أسعار المنتجات: SubTotal المطبوع، وإلا Total ناقص التوصيل المطبوع."""
+    if subtotal is not None:
+        return round(subtotal, 2), "subtotal"
+    if total is None:
+        return None, None
+    if delivery is not None:
+        return round(total - delivery, 2), "total_minus_delivery"
+    if delivery_printed is False:
+        return round(total, 2), "total_no_delivery_line"
+    return None, None
+
+
+def _norm_adjustments(raw):
+    """خصم أو كوبون أو عرض أو أي رسوم غير التوصيل — تُنسخ كما طُبعت ولا يُقرَّر فيها شيء."""
+    out = []
+    for a in (raw or []):
+        if isinstance(a, dict):
+            label = str(a.get("label") or a.get("name") or a.get("type") or "").strip()
+            amount = _num(a.get("amount") if a.get("amount") is not None else a.get("value"))
+        else:
+            label, amount = str(a or "").strip(), None
+        if label or amount is not None:
+            out.append({"label": label[:80], "amount": amount})
+    return out
 
 
 def normalize_result(parsed):
@@ -594,50 +751,27 @@ def normalize_result(parsed):
     if not isinstance(parsed, dict) or "raw_response" in parsed:
         return parsed
 
-    items = []
-    raw_items = _merge_weight_variant_lines(
-        [x for x in (parsed.get("items") or []) if isinstance(x, dict)]
-    )
-    for raw_item in raw_items:
-        if not isinstance(raw_item, dict):
-            continue
-        weight_value, weight_unit = _norm_weight(raw_item)
-        line_total = _num(raw_item.get("line_total"))
-        unit_price = _num(raw_item.get("price"))
-        quantity = _num(raw_item.get("quantity"))
-        quantity = int(quantity) if quantity is not None else None
-        if line_total is None and unit_price is not None:
-            line_total = round(unit_price * (quantity or 1), 2)
+    raw_lines = [x for x in (_norm_raw_line(l) for l in (parsed.get("lines") or [])) if x]
+    lines_source = "lines"
+    if not raw_lines and parsed.get("items"):
+        # توافق خلفي مع رد بالشكل القديم: تُقرأ عناصره كسطور مطبوعة وتُبنى بنفس القواعد.
+        raw_lines = [x for x in (_norm_raw_line(l) for l in (parsed.get("items") or [])) if x]
+        lines_source = "items_fallback"
 
-        basis = str(raw_item.get("weight_basis") or "").strip().lower()
-        if basis not in ("per_unit", "line_total"):
-            basis = None
+    subtotal = _num(parsed.get("subtotal"))
+    delivery = _num(parsed.get("delivery"))
+    dp = parsed.get("delivery_printed")
+    delivery_printed = dp if isinstance(dp, bool) else None
+    printed_total = _num(parsed.get("total"))
+    if printed_total is None:
+        printed_total = _num(parsed.get("order_total"))
+    reference, ref_basis = _reference_sum(subtotal, delivery, delivery_printed, printed_total)
 
-        total_value, total_unit = _norm_weight({
-            "weight_value": raw_item.get("total_weight_value"),
-            "weight_unit": raw_item.get("total_weight_unit"),
-            "weight": None,
-        })
-        total_weight_g = _grams(total_value, total_unit)
-        unit_weight_g = _grams(weight_value, weight_unit)
-        if total_weight_g is None and unit_weight_g is not None:
-            if basis == "line_total":
-                total_weight_g = unit_weight_g
-            else:
-                total_weight_g = round(unit_weight_g * (quantity or 1), 2)
+    items, merge_notes = _assemble_products(raw_lines, reference)
 
-        items.append({
-            "code": _norm_code(raw_item),
-            "name": _clean_name(raw_item.get("name")),
-            "quantity": quantity,
-            "weight_value": weight_value,
-            "weight_unit": weight_unit,
-            "weight": raw_item.get("weight"),
-            "weight_basis": basis,
-            "total_weight_g": total_weight_g,
-            "price": unit_price,
-            "line_total": line_total,
-        })
+    items_count = _num(parsed.get("items_count"))
+    items_count = int(items_count) if items_count is not None else None
+    adjustments = _norm_adjustments(parsed.get("adjustments"))
 
     order_code = parsed.get("order_code")
     order_code = str(order_code).strip() if order_code not in (None, "", "null") else None
@@ -648,25 +782,38 @@ def normalize_result(parsed):
 
     platform = _norm_platform(parsed.get("platform") or parsed.get("order_source_hint"))
     branch = _norm_branch(parsed.get("branch"))
-    order_total = _num(parsed.get("order_total"))
 
     medium = str(parsed.get("evidence_medium") or "").strip().lower()
     if medium not in _MEDIUM:
         medium = "unknown"
 
-    # شاشة تطبيق تحضير بلا اسم شركة ولا فرع ولا إجمالي مطبوع = هنجر.
-    # يُعلَّم مصدر المنصة حتى يعرف n8n أنها استنتاج من نوع الدليل لا قراءة مباشرة.
+    # شاشة تطبيق تحضير بلا اسم شركة ولا فرع ولا مرجع مطبوع = هنجر.
     platform_source = "read" if platform != "unknown" else "none"
-    if platform == "unknown" and medium == "app_screen" and branch is None and order_total is None:
+    if platform == "unknown" and medium == "app_screen" and branch is None and reference is None:
         platform = "hunger"
         platform_source = "inferred_medium"
 
-    invoice_items = _norm_invoice_items(_merge_weight_variant_lines(
-        [x for x in (parsed.get("invoice_items") or []) if isinstance(x, dict)],
-        price_keys=("line_total", "unit_price"),
-    ))
-    invoice_items, invoice_sum_check = _reconcile_invoice_items(
-        invoice_items, items, order_total)
+    # قائمة الفاتورة كما طُبعت سطراً سطراً، بلا دمج — للتوثيق والمراجعة.
+    invoice_items = [{
+        "code": l.get("code"),
+        "name": l.get("name"),
+        "quantity": l.get("qty"),
+        "unit_price": l.get("price"),
+        "line_total": l.get("price"),
+        "raw_text": l.get("raw_text"),
+    } for l in raw_lines]
+
+    products_sum = None
+    priced = [_num(p.get("line_total")) for p in items if _num(p.get("line_total")) is not None]
+    if priced:
+        products_sum = round(sum(priced), 2)
+    if reference is None:
+        invoice_sum_check = "no_total"
+    elif products_sum is not None and abs(products_sum - reference) <= _SELF_CHECK_TOL:
+        invoice_sum_check = "ok"
+    else:
+        invoice_sum_check = "conflict"
+
     prepared_items = _norm_prepared_items(parsed.get("prepared_items"))
     fulfillment = _norm_fulfillment(parsed.get("fulfillment"), prepared_items)
 
@@ -674,7 +821,7 @@ def normalize_result(parsed):
         "order_code": _norm_conf(field_conf.get("order_code")) if order_code else "low",
         "platform": _norm_conf(field_conf.get("platform")) if platform != "unknown" else "low",
         "branch": _norm_conf(field_conf.get("branch")) if branch else "low",
-        "order_total": _norm_conf(field_conf.get("order_total")) if order_total else "low",
+        "order_total": _norm_conf(field_conf.get("order_total")) if reference is not None else "low",
     }
 
     return {
@@ -682,8 +829,21 @@ def normalize_result(parsed):
         "platform": platform,
         "branch": branch,
         "order_date": parsed.get("order_date") or None,
-        "order_total": order_total,
+        # order_total = مرجع أسعار المنتجات (بلا توصيل) وهو ما يُقارن بفاتورة سماك.
+        "order_total": reference,
+        "order_total_basis": ref_basis,
+        "printed_total": printed_total,
+        "subtotal": subtotal,
+        "delivery": delivery,
+        "delivery_printed": delivery_printed,
+        "adjustments": adjustments,
+        "items_count": items_count,
+        "products_count": len(items),
+        "products_sum": products_sum,
         "currency": parsed.get("currency") or "SAR",
+        "lines": raw_lines,
+        "lines_source": lines_source,
+        "merge_notes": merge_notes,
         "items": items,
         "evidence_medium": medium,
         "platform_source": platform_source,
@@ -694,8 +854,9 @@ def normalize_result(parsed):
         "order_source_hint": parsed.get("order_source_hint") or "not_applicable",
         "confidence": _norm_conf(parsed.get("confidence")),
         "field_confidence": field_confidence,
-        "self_check": _self_check(order_code, platform, order_total, items,
-                                  invoice_sum_check, field_confidence),
+        "self_check": _self_check(order_code, platform, reference, ref_basis, items,
+                                  items_count, merge_notes, invoice_sum_check,
+                                  field_confidence),
     }
 
 
@@ -711,150 +872,104 @@ def analyze_with_claude(image_content_blocks: list[dict], invoice_text: str | No
 
     prompt = (
         "أنت مساعد ذكاء اصطناعي متخصص في التحقق من طلبات التوصيل عبر تحليل فيديو فتح الطرد.\n\n"
-        "مهمتك: تحليل الإطارات المرفقة من الفيديو لاستخراج معلومات الطلب والتحقق من الأصناف، "
-        "ومقارنتها بنص الفاتورة إن توفر.\n\n"
+        "مهمتك ثلاثة أشياء فقط: (1) نسخ سطور الفاتورة أو شاشة الطلب كما هي مطبوعة حرفياً، "
+        "(2) نسخ المبالغ المطبوعة أسفلها كما هي، (3) وصف ما رأيته فعلاً من عبوات مادية.\n"
+        "ممنوع منعاً قاطعاً: لا تدمج سطرين، ولا تضرب سعراً في كمية، ولا تجمع مبالغ، ولا تحسب "
+        "إجمالياً، ولا تفسّر ولا تصحّح ما هو مطبوع. الحساب كله يجري بعدك في البرنامج. "
+        "مهمتك النسخ الأمين فقط. أي قيمة غير مقروءة = null، ولا تخمين إطلاقاً.\n\n"
         "تمييز مهم بين نوعين مختلفين من الأكواد — لا تخلط بينهما أبداً:\n"
-        "1) order_code (رقم الطلب الحقيقي): رقم طويل عادة من 9 إلى 10 خانات، يظهر على شاشة "
-        "تطبيق التوصيل (شاشة جوال المندوب أو تطبيق الطلبات)، وليس مطبوعاً على المنتج نفسه. "
-        "ابحث عنه فقط في الإطارات التي تُظهر شاشة جوال/تطبيق.\n"
-        "2) كود الصنف / SKU: رمز قصير (مثل R210) مطبوع على ملصق المنتج أو التغليف، يعرّف "
-        "الصنف وليس الطلب. لا تضع كود الصنف مكان order_code أبداً حتى لو كان هو الرقم الوحيد "
-        "الظاهر بوضوح في بعض الإطارات.\n"
+        "1) order_code (رقم الطلب الحقيقي): رقم طويل يظهر على شاشة تطبيق التوصيل أو أعلى "
+        "الفاتورة المطبوعة، وليس مطبوعاً على المنتج نفسه.\n"
+        "2) كود الصنف / SKU: رمز قصير (مثل R210) مطبوع على سطر المنتج في الفاتورة أو على ملصق "
+        "العبوة، يعرّف الصنف لا الطلب. لا تضعه مكان order_code أبداً.\n"
         "إذا لم يظهر order_code بوضوح في أي إطار، ضع قيمته null بدلاً من تخمينه من كود صنف.\n\n"
-        "الأصناف بدون ملصق واضح:\n"
-        "إذا ظهر صنف بدون ملصق مقروء أو بدون كود صنف واضح، تعرّف عليه بصرياً (الشكل، اللون، "
-        "التغليف، الحجم) وطابقه مع أي كتالوج مصوّر أو ورقة أصناف نصية تظهر في الفيديو نفسه، إن "
-        "وُجدت. إذا تعذّر التطابق بثقة، أدرج الصنف بوصف مختصر لما تراه بدل اختلاق كود له.\n"
-        "سجّل في order_source_hint أي مرجع استخدمته للتعرف على الأصناف بدون ملصق واضح:\n"
-        "- 'image_catalog' إذا اعتمدت على كتالوج صور ظاهر بالفيديو\n"
-        "- 'text_list' إذا اعتمدت على ورقة نصية بأسماء/أكواد الأصناف ظاهرة بالفيديو\n"
-        "- 'mixed' إذا استخدمت الاثنين معاً لأصناف مختلفة\n"
-        "- 'not_applicable' إذا كانت كل الأصناف عليها ملصق واضح ولم تحتج مرجعاً بديلاً\n\n"
-        "تفاصيل إضافية مطلوبة لكل صنف على حدة:\n"
-        "- weight: الوزن أو الحجم المطبوع على ملصق العبوة نفسها فقط، كما يظهر نصياً بالضبط "
-        "(مثال: '250 جرام'، '1 كيلو'). استخرجه من الملصق فقط، وضع null إذا لم يظهر وزن/حجم "
-        "واضح ومقروء على العبوة.\n"
-        "- price: سعر هذا الصنف تحديداً كما يظهر على شاشة تطبيق التوصيل (شاشة تفاصيل الطلب "
-        "في الفيديو) — وليس من ملصق العبوة أو من أي مصدر آخر. ضع الرقم فقط بدون رمز العملة "
-        "إذا ظهر بوضوح مرتبطاً بهذا الصنف تحديداً، أو null إذا لم يظهر سعر فردي واضح لهذا "
-        "الصنف على شاشة التطبيق.\n"
-        "لا تخمّن أي قيمة وزن أو سعر غير ظاهرة بوضوح — استخدم null دائماً بدل التخمين.\n\n"
-        "مهم جداً بخصوص السعر تحديداً: شاشة تطبيق التوصيل التي تُظهر سعر كل صنف قد لا تظهر "
-        "إلا في إطار واحد فقط من بين كل الإطارات المرفقة لك (قد تكون في بداية الفيديو أو "
-        "وسطه أو آخره)، بينما تُظهر بقية الإطارات فتح الطرد أو ملصقات المنتجات. لذلك قبل أن "
-        "تضع price كـ null لأي صنف، افحص كل إطار مرفق لك بالكامل، واحداً تلو الآخر، بحثاً عن "
-        "شاشة تفاصيل الطلب — ولا تكتفِ بفحص أول إطار أو آخر إطار فقط. عدم ظهور شاشة السعر في "
-        "الإطارات الأولى لا يعني إطلاقاً عدم وجودها في إطار لاحق.\n\n"
-        "نوع الدليل المصوَّر — حدّده أولاً قبل أي استخراج، وضعه في evidence_medium:\n"
+        "نوع الدليل المصوَّر — حدّده أولاً وضعه في evidence_medium:\n"
         "- 'printed_receipt': الفيديو يعرض فاتورة ورقية مطبوعة، فيها عادةً اسم منصة التوصيل واسم الفرع "
-        "وقائمة الأصناف وسطر إجمالي (Total).\n"
+        "وقائمة السطور ومبالغ أسفلها.\n"
         "- 'app_screen': الفيديو يعرض شاشة تطبيق تحضير الطلبات على جوال أو جهاز لوحي — قائمة طلبات، "
         "بطاقات منتجات بصور، تبويبات مثل To pick / Picked / Not Found — ولا توجد فاتورة ورقية.\n"
         "- 'unknown': لا هذا ولا ذاك.\n"
         "قاعدة إلزامية: إذا كان evidence_medium = 'app_screen' ولم يظهر اسم شركة توصيل ولا اسم فرع ولا "
-        "إجمالي مطبوع للطلب، فالمنصة هي hunger — ضع platform = 'hunger' ولا تضع unknown.\n\n"
-        "حقول إضافية مطلوبة على مستوى الطلب ككل — استخرجها من شاشة تطبيق التوصيل:\n"
-        "- platform: المنصة التي جاء منها الطلب، من شعار التطبيق أو اسمه الظاهر على الشاشة. "
-        "القيم المسموحة فقط: keeta | jahez | hunger | ninja | thechefz | marsool | toyou | unknown. "
-        "لا تستنتج المنصة من شكل رقم الطلب إطلاقاً — فقط من الشعار أو الاسم الظاهر بالفيديو.\n"
-        "- branch: الفرع أو المخزن الظاهر على الملصق أو الشاشة. القيم المتوقعة: "
-        "Al Masiaf أو Al Wisham أو Al Khaleej أو Al Yasmin أو Dhahrat Laban، أو رمز المخزن "
-        "من 0001 إلى 0005، أو null إن لم يظهر.\n"
+        "مبالغ مطبوعة، فالمنصة هي hunger — ضع platform = 'hunger' ولا تضع unknown.\n\n"
+        "حقول على مستوى الطلب:\n"
+        "- platform: من شعار التطبيق أو الاسم الظاهر فقط. القيم المسموحة: "
+        "keeta | jahez | hunger | ninja | thechefz | marsool | toyou | unknown. "
+        "لا تستنتج المنصة من شكل رقم الطلب إطلاقاً.\n"
+        "- branch: الفرع أو المخزن الظاهر. القيم المتوقعة: Al Masiaf أو Al Wisham أو Al Khaleej "
+        "أو Al Yasmin أو Dhahrat Laban، أو رمز المخزن من 0001 إلى 0005، أو null.\n"
         "- order_date: تاريخ الطلب بصيغة YYYY-MM-DD إن ظهر، وإلا null.\n"
-        "- order_total: الإجمالي النهائي للطلب كما هو مطبوع على شاشة تفاصيل الطلب شاملاً الضريبة، "
-        "رقم فقط بدون رمز العملة. لا تحسبه بنفسك بجمع الأصناف — استخرجه كما هو مطبوع، وضع null "
-        "إن لم يظهر إجمالي واضح.\n\n"
-        "حقول إضافية مطلوبة لكل صنف على حدة:\n"
-        "- code: كود الصنف بصيغة حرف R متبوعاً برقم مثل R253. قد يظهر بالعربية (ر253) أو داخل "
-        "أقواس — طبّعه دائماً إلى الصيغة R253. ضع null إن لم يظهر كود على الملصق.\n"
-        "- quantity: عدد القطع من هذا الصنف كرقم صحيح. انتبه جيداً: الكمية غير الوزن. صنف وزن "
-        "عبوته 250 جرام وعدد قطعه اثنتان يكون quantity = 2 و weight_value = 250. ضع null إن لم "
-        "يظهر العدد.\n"
-        "- weight_value و weight_unit: نفس الوزن المذكور أعلاه لكن مفصولاً — رقم مجرد بلا وحدة "
-        "في weight_value، والوحدة في weight_unit بقيمة g أو kg فقط.\n"
-        "- ربط الوزن بالصنف الصحيح: خذ الوزن من ملصق عبوة هذا الصنف نفسه فقط. إذا ظهرت في "
-        "الفيديو عدة عبوات ولم تجزم بأن الوزن الذي تراه يخص هذا الصنف تحديداً، ضع weight_value "
-        "و total_weight_value بقيمة null. لا تنسب وزن عبوة إلى صنف آخر إطلاقاً، ولا تخمّن وزناً "
-        "من اسم الصنف أو من سعره.\n"
-        "- weight_basis: ماذا يمثل الوزن الذي استخرجته؟ 'per_unit' إذا كان وزن العبوة الواحدة "
-        "من هذا الصنف، أو 'line_total' إذا كان الوزن المطبوع يمثل كامل كمية هذا السطر مجتمعة "
-        "(عبوة واحدة مجمّعة، أو وزن إجمالي مكتوب للسطر). ضع null إن لم يظهر وزن.\n"
-        "- total_weight_value و total_weight_unit: الوزن الإجمالي لهذا السطر بكامل كميته. إذا "
-        "كان weight_basis = 'per_unit' فاضرب وزن العبوة الواحدة في الكمية (مثال: قطعتان وزن "
-        "كل عبوة 200 جرام يعني total_weight_value = 400 و total_weight_unit = g). وإذا كان "
-        "'line_total' فانقل الوزن كما هو بلا ضرب. ضع null إن لم يظهر وزن.\n"
-        "- line_total: إجمالي هذا السطر شاملاً الضريبة. إذا كان الظاهر سعر القطعة الواحدة فقط "
-        "فاضربه في الكمية. ضع null إن تعذّر.\n\n"
-        "بنية السطرين للصنف الواحد في فواتير المنصات (جاهز/كيتا/بلند) — انتبه لها جيداً:\n"
-        "كل منتج يُطبع على سطرين متتاليين: سطر علوي بارز فيه العدد واسم المنتج وكود R وسعر أساسي، "
-        "وتحته مباشرة سطر مُزاح للداخل يحمل متغيّر الوزن (500g أو 250g أو 1kg…) وسعر فرق الوزن. "
-        "السطران منتج واحد لا منتجان، والسعر الفعلي للصنف = مجموع سعري السطرين.\n"
-        "مثال حقيقي من فاتورة جاهز ترويستها '3 Items' ومجموعها 134.92:\n"
-        "  1X Japanese Mixed Nuts R76          29.98\n"
-        "     1X Japanese mixed nuts R76 500g  29.98   <- نفس الصنف، فرق وزن\n"
-        "  1X Japanese Nuts R514               29.98\n"
-        "     1X 500g Japanese nuts R514       29.98   <- الوزن قبل الاسم هنا\n"
-        "  1X Natural Plant Sugar R138         15.00\n"
-        "     1X Natural Plant Sugar 250g       0.00   <- فرق الوزن صفر\n"
-        "النتيجة الصحيحة ثلاثة أصناف: R76 بـ59.96 و R514 بـ59.96 و R138 بـ15.00، ومجموعها 134.92.\n"
-        "القواعد:\n"
-        "- ادمج السطرين في عنصر واحد: الاسم من السطر العلوي، والوزن من السطر السفلي، والسعر مجموع السعرين.\n"
-        "- إذا كان سعر السطر السفلي 0.00 فالسعر النهائي هو سعر السطر العلوي وحده.\n"
-        "- لا تعتمد على كود R وحده للربط: بعض الأسطر السفلية لا تحمل الكود إطلاقاً، وبعضها يضع الوزن "
-        "قبل الاسم. اعتمد أيضاً على التجاور (السطر التالي مباشرة والمُزاح للداخل) وعلى التطابق الجزئي بالاسم.\n"
-        "- لا تُنشئ عنصرين منفصلين، ولا تُسقط السطر السفلي، ولا تعدّه كمية إضافية.\n"
-        "- سطر 'N Items' أعلى القائمة يساوي عدد الأصناف بعد الدمج — استخدمه للتحقق من عددها.\n"
-        "- تحقّق أخيراً: مجموع أسعار الأصناف بعد الدمج يجب أن يساوي SubTotal/Total المطبوع. إن لم يساوِه "
-        "فراجع الدمج قبل إخراج النتيجة.\n"
-        "- استثناء: سطران متطابقان تماماً (نفس الاسم ونفس الوزن ونفس السعر) هما قطعتان مستقلتان من "
-        "الصنف نفسه، لا متغيّر وزن — اجمع كميتهما ولا تعاملهما معاملة السطرين أعلاه.\n\n"
-        "مطلوب منك بعد ذلك قائمتان مستقلتان تماماً — لا تدمجهما ولا تدع إحداهما تؤثر في الأخرى:\n"
-        "1) invoice_items — ما طلبه العميل كما هو مكتوب على الفاتورة الورقية أو شاشة تطبيق الطلبات فقط. "
-        "لكل سطر: name كما هو مكتوب، quantity، unit_price، line_total، و code إن كان كود R مطبوعاً على "
-        "الفاتورة نفسها (كثير من الفواتير لا تطبعه — ضع null حينها). لا تأخذ شيئاً هنا من ملصقات العبوات.\n"
-        "invoice_items و items قراءتان لنفس الفاتورة: يجب أن تتطابقا بنداً ببند بعد دمج "
-        "أسطر متغيّر الوزن — نفس الأكواد ونفس الأسعار — ومجموع line_total في كلٍّ منهما "
-        "يجب أن يساوي order_total المطبوع. راجع الجمع قبل أن ترد.\n"
-        "2) prepared_items — ما رأيته فعلاً من عبوات مادية محضّرة في الفيديو. لكل صنف رأيت عبوته: code من "
-        "ملصقها، name من ملصقها، seen_count = عدد العبوات المتطابقة التي رأيتها من هذا الصنف، و label_weight "
-        "كما هو مطبوع على الملصق نصياً.\n"
-        "ممنوع منعاً قاطعاً: لا تُدرج في prepared_items أي صنف لم ترَ عبوته فعلاً في إطار من الإطارات، حتى "
-        "لو كان مذكوراً في الفاتورة، وحتى لو كان وجوده منطقياً. prepared_items شهادة بصرية لا استنتاج. "
+        "- items_count: الرقم المطبوع في سطر مثل '3 Items' أو '2 أصناف' أعلى قائمة السطور، كرقم "
+        "صحيح كما هو مطبوع. هذا عدد المنتجات لا عدد الحبات. null إن لم يُطبع.\n\n"
+        "«lines» — قلب المهمة: انسخ كل سطر مطبوع في قائمة الطلب سطراً سطراً بالترتيب من أعلى إلى "
+        "أسفل، بلا حذف ولا دمج ولا إعادة ترتيب. لكل سطر:\n"
+        "- qty: الرقم المطبوع في بداية السطر (2X تعني 2، و1X تعني 1)، رقم صحيح، أو null إن لم يُطبع.\n"
+        "- name: نص اسم الصنف في هذا السطر كما هو مطبوع.\n"
+        "- code: كود R المطبوع في هذا السطر تحديداً (R253، وقد يظهر بالعربية ر253 أو داخل أقواس — "
+        "طبّعه إلى R253). null إن لم يُطبع كود في هذا السطر بذاته. لا تنقل كود سطر إلى سطر آخر.\n"
+        "- weight: الوزن أو الحجم المطبوع في هذا السطر نصياً كما هو ('500g'، '250 جرام'، '1kg')، "
+        "أو null إن لم يُطبع وزن في هذا السطر.\n"
+        "- price: المبلغ المطبوع في نهاية هذا السطر كرقم بلا رمز عملة (قد يكون 0.00 وهذا يُنسخ كما "
+        "هو ولا يُهمَل)، أو null إن لم يُطبع مبلغ.\n"
+        "- raw_text: السطر كما هو مطبوع نصاً كاملاً، للمراجعة.\n"
+        "ملاحظة: فواتير المنصات تطبع كثيراً من المنتجات على سطرين متتاليين (سطر بالاسم والكود "
+        "والسعر، وتحته سطر مُزاح فيه الوزن وسعر إضافي قد يكون 0.00). انسخهما سطرين منفصلين كما "
+        "هما — البرنامج هو من يربطهما. لا تدمجهما أنت ولا تُسقط أحدهما.\n\n"
+        "«المبالغ أسفل القائمة» — انسخها كما طُبعت، كل واحد في حقله:\n"
+        "- subtotal: المبلغ المطبوع أمام SubTotal أو Sub Total أو المجموع، أو null إن لم يُطبع.\n"
+        "- delivery: المبلغ المطبوع أمام Delivery أو Delivery Fee أو توصيل أو رسوم توصيل، "
+        "أو null إن لم يُطبع سطر توصيل أو تعذّرت قراءة مبلغه.\n"
+        "- delivery_printed: true إذا كان في الفاتورة سطر توصيل (حتى لو لم تُقرأ قيمته)، "
+        "و false إذا لم يوجد سطر توصيل إطلاقاً.\n"
+        "- total: المبلغ المطبوع أمام Total أو الإجمالي، أو null إن لم يُطبع.\n"
+        "- adjustments: قائمة بكل سطر مبلغ آخر ليس منتجاً وليس توصيلاً — خصم، كوبون، عرض، "
+        "Promo، Discount، Voucher، أو أي رسوم أخرى. لكل واحد: label كما طُبع نصاً، و amount "
+        "كرقم كما طُبع (بإشارته إن كانت سالبة). قائمة فارغة إن لم يوجد شيء من هذا. "
+        "لا تُدرج التوصيل هنا، ولا تُدرج SubTotal ولا Total.\n"
+        "لا تجمع هذه المبالغ ولا تطرحها من شيء — انسخها فقط.\n\n"
+        "«prepared_items» — ما رأيته فعلاً من عبوات مادية محضّرة في الفيديو. لكل صنف رأيت عبوته: "
+        "code من ملصقها، name من ملصقها، seen_count = عدد العبوات المتطابقة التي رأيتها من هذا "
+        "الصنف، و label_weight كما هو مطبوع على الملصق نصياً.\n"
+        "ممنوع منعاً قاطعاً: لا تُدرج صنفاً لم ترَ عبوته فعلاً في إطار من الإطارات، حتى لو كان "
+        "مذكوراً في الفاتورة، وحتى لو كان وجوده منطقياً. prepared_items شهادة بصرية لا استنتاج. "
         "وبالمقابل، إذا رأيت عبوة لصنف غير مذكور في الفاتورة فأدرجها كما هي.\n"
-        "3) fulfillment — مقارنتك بين القائمتين:\n"
-        "- coverage: 'full' إذا أظهر الفيديو كل العبوات المحضّرة بوضوح يكفي للحكم، 'partial' إذا أظهر "
-        "بعضها فقط، 'none' إذا لم يُظهر أي عبوة بوضوح.\n"
+        "الأصناف بدون ملصق واضح: تعرّف عليها بصرياً وطابقها مع أي كتالوج مصوّر أو ورقة أصناف نصية "
+        "تظهر في الفيديو نفسه، وسجّل في order_source_hint ما استخدمته: 'image_catalog' أو "
+        "'text_list' أو 'mixed' أو 'not_applicable'. إن تعذّر التطابق بثقة فاذكر وصفاً مختصراً "
+        "بدل اختلاق كود.\n\n"
+        "«fulfillment» — مقارنتك بين ما طُلب وما رأيته محضّراً:\n"
+        "- coverage: 'full' إذا أظهر الفيديو كل العبوات المحضّرة بوضوح يكفي للحكم، 'partial' إذا "
+        "أظهر بعضها فقط، 'none' إذا لم يُظهر أي عبوة بوضوح.\n"
         "- verdict: 'matched' أو 'mismatch' أو 'not_verifiable'.\n"
-        "- lines: سطر لكل كود ظهر في أي من القائمتين، فيه code و status و note مختصرة. قيم status:\n"
-        "  'matched' موجود بالفاتورة ورأيته محضّراً بنفس العدد والوزن؛ 'missing' بالفاتورة ولم أره وأنا "
-        "واثق لأن الفيديو أظهر كل ما جُهِّز؛ 'extra' رأيت عبوة لصنف ليس بالفاتورة؛ 'weight_diff' موجود في "
-        "الاثنين لكن وزن الملصق يخالف وزن الفاتورة؛ 'not_seen' بالفاتورة ولم أستطع رؤيته بوضوح كافٍ للحكم.\n"
-        "القاعدة الحاسمة: لا تستخدم 'missing' إلا إذا كان coverage = 'full' وكنت متأكداً أن الفيديو عرض كل "
-        "ما جُهِّز. في أي حالة شك استخدم 'not_seen'. الفرق بينهما جوهري: 'missing' اتهام للموظف، "
-        "و'not_seen' اعتراف بأن الصورة لم تكفِ. الاعتراف أفضل من اتهام خاطئ.\n\n"
+        "- lines: سطر لكل كود ظهر في أي من الجانبين، فيه code و status و note مختصرة. قيم status: "
+        "'matched' مطلوب ورأيته محضّراً بنفس العدد والوزن؛ 'missing' مطلوب ولم أره وأنا واثق لأن "
+        "الفيديو أظهر كل ما جُهِّز؛ 'extra' رأيت عبوة لصنف غير مطلوب؛ 'weight_diff' موجود في "
+        "الجانبين لكن وزن الملصق يخالف وزن السطر؛ 'not_seen' مطلوب ولم أستطع رؤيته بوضوح كافٍ.\n"
+        "القاعدة الحاسمة: لا تستخدم 'missing' إلا إذا كان coverage = 'full'. في أي شك استخدم "
+        "'not_seen'. الفرق جوهري: 'missing' اتهام للموظف، و'not_seen' اعتراف بأن الصورة لم تكفِ.\n\n"
+        "مهم بخصوص الأسعار: شاشة تفاصيل الطلب التي تُظهر الأسعار قد تظهر في إطار واحد فقط من كل "
+        "الإطارات (في البداية أو الوسط أو النهاية). قبل أن تضع price أو المبالغ بـ null، افحص كل "
+        "إطار مرفق واحداً تلو الآخر بحثاً عن سطور الطلب والمبالغ.\n\n"
         "وأخيراً field_confidence: درجة ثقتك في كل حقل حرج على حدة (high أو medium أو low). "
-        "أي حقل وضعت قيمته null يجب أن تكون ثقته low.\n\n"
+        "أي حقل وضعت قيمته null يجب أن تكون ثقته low. حقل order_total هنا يعني ثقتك في المبالغ "
+        "المطبوعة أسفل القائمة (subtotal/total).\n\n"
         "أعد النتيجة بصيغة JSON فقط بدون أي نص إضافي، وفق الحقول التالية بالضبط:\n"
-        '{"order_code": "الرقم الطويل من شاشة التطبيق، أو null إن لم يظهر", '
+        '{"order_code": "رقم الطلب أو null", '
         '"platform": "keeta|jahez|hunger|ninja|thechefz|marsool|toyou|unknown", '
         '"branch": "اسم الفرع أو رمز المخزن أو null", '
         '"order_date": "YYYY-MM-DD أو null", '
-        '"order_total": "الإجمالي النهائي كرقم أو null", '
-        '"currency": "SAR", '
-        '"items": [{"code": "R253 أو null", '
-        '"name": "اسم الصنف بدون الكود", '
-        '"quantity": "عدد القطع كرقم أو null", '
-        '"weight_value": "الوزن كرقم مجرد أو null", '
-        '"weight_unit": "g أو kg", '
-        '"weight_basis": "per_unit أو line_total أو null", '
-        '"total_weight_value": "الوزن الإجمالي لكامل كمية السطر كرقم أو null", '
-        '"total_weight_unit": "g أو kg", '
-        '"weight": "الوزن/الحجم من ملصق العبوة أو null", '
-        '"price": "سعر الصنف من شاشة التطبيق أو null", '
-        '"line_total": "إجمالي السطر أو null"}], '
+        '"items_count": "الرقم المطبوع في سطر N Items أو null", '
+        '"lines": [{"qty": "الرقم في بداية السطر أو null", '
+        '"name": "اسم الصنف كما هو مطبوع في هذا السطر", '
+        '"code": "R253 أو null إن لم يُطبع في هذا السطر", '
+        '"weight": "الوزن المطبوع في هذا السطر نصياً أو null", '
+        '"price": "المبلغ في نهاية السطر كرقم أو null", '
+        '"raw_text": "السطر كما هو مطبوع"}], '
+        '"subtotal": "المبلغ أمام SubTotal أو null", '
+        '"delivery": "المبلغ أمام Delivery أو null", '
+        '"delivery_printed": "true أو false", '
+        '"total": "المبلغ أمام Total أو null", '
+        '"adjustments": [{"label": "نص السطر كما طُبع", "amount": "المبلغ كرقم أو null"}], '
         '"evidence_medium": "printed_receipt|app_screen|unknown", '
-        '"invoice_items": [{"code": "R253 أو null", "name": "اسم الصنف كما هو مكتوب بالفاتورة", '
-        '"quantity": "عدد أو null", "unit_price": "سعر القطعة أو null", "line_total": "إجمالي السطر أو null"}], '
         '"prepared_items": [{"code": "كود R من الملصق أو null", "name": "الاسم من الملصق", '
         '"seen_count": "عدد العبوات التي رأيتها من هذا الصنف", "label_weight": "الوزن المطبوع على الملصق أو null"}], '
         '"fulfillment": {"coverage": "full|partial|none", "verdict": "matched|mismatch|not_verifiable", '
