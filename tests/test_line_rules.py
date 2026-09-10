@@ -88,7 +88,7 @@ check("المرجع = SubTotal 76.00", r["order_total"] == 76.00 and r["order_to
 check("التوصيل منسوخ ولم يدخل المجموع", r["delivery"] == 18.00 and r["products_sum"] == 76.00, (r["delivery"], r["products_sum"]))
 check("الفحص الذاتي سليم", r["self_check"]["passed"], r["self_check"]["summary"])
 
-print("\n3) qwf-5-1106 — سطر وزن باسم مختلف يؤكده المبلغ المطبوع")
+print("\n3) qwf-5-1106 — سطر وزن باسم مختلف يؤكده «N Items» المطبوع")
 r = run([
     L(1, "Dried Fruits With Apricots and Prunes R584", "R584", None, 25.00),
     L(1, "Dried fruits prunes Bukhara 500g", None, "500g", 25.00),
@@ -208,6 +208,36 @@ r = run([
 ], subtotal=30.00, delivery=18.00, delivery_printed=True, total=30.00, items_count=1)
 check("لا منتج اسمه توصيل", not any("توصيل" in (p.get("name") or "") or "delivery" in (p.get("name") or "").lower() for p in r["items"]), r["items"])
 check("عدد المنتجات 1", len(r["items"]) == 1, len(r["items"]))
+
+print("\n16) سطر وزن باسم مختلف و«N Items» غير مقروء — لا يُدمج مع سبب صريح")
+r = run([
+    L(1, "Dried Fruits With Apricots and Prunes R584", "R584", None, 25.00),
+    L(1, "Dried fruits prunes Bukhara 500g", None, "500g", 25.00),
+], subtotal=50.00, total=50.00, items_count=None)
+check("منتجان لا منتج", len(r["items"]) == 2, len(r["items"]))
+check("السبب حرفياً كما طلبت",
+      any("اسم السطر السفلي مختلف" in n and "ولا يوجد عدد منتجات للتأكيد" in n for n in r["merge_notes"]),
+      r["merge_notes"])
+check("سقط lines_merged_cleanly", "lines_merged_cleanly" in r["self_check"]["failed"], r["self_check"]["failed"])
+
+print("\n17) سطر وزن باسم مختلف و«N Items» مقروء لكنه لا يطابق بعد الدمج — لا يُدمج")
+r = run([
+    L(1, "Dried Fruits With Apricots and Prunes R584", "R584", None, 25.00),
+    L(1, "Dried fruits prunes Bukhara 500g", None, "500g", 25.00),
+], subtotal=50.00, total=50.00, items_count=2)
+check("منتجان (العدد المطبوع 2)", len(r["items"]) == 2, len(r["items"]))
+check("عدد المنتجات مطابق للمطبوع", "items_count_match" not in r["self_check"]["failed"], r["self_check"]["failed"])
+
+print("\n18) سطر بلا كود وتشابه اسمه ≥ 0.85 — يُدمج بلا حاجة لعدد المنتجات")
+r = run([
+    L(1, "Raw Sunflower Seeds R665", "R665", None, 9.50),
+    L(1, "Raw sunflower seeds 1000g", None, "1000g", 28.50),
+], subtotal=38.00, total=38.00, items_count=None)
+p18 = prod(r, "R665")
+check("منتج واحد", len(r["items"]) == 1, len(r["items"]))
+check("سعر الحبة 38.00 والوزن 1000جم",
+      p18["line_total"] == 38.00 and p18["total_weight_g"] == 1000.0, p18)
+check("بلا ملاحظات دمج", r["merge_notes"] == [], r["merge_notes"])
 
 print("\n" + ("=" * 60))
 if FAILED:
