@@ -8,7 +8,7 @@ import os, sys, json
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key-not-used")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from app.main import normalize_result, _ORDER_CODE_LEN  # noqa: E402
+from app.main import normalize_result, _ORDER_CODE_LEN, _norm_order_date  # noqa: E402
 
 FAILED = []
 
@@ -238,6 +238,41 @@ check("منتج واحد", len(r["items"]) == 1, len(r["items"]))
 check("سعر الحبة 38.00 والوزن 1000جم",
       p18["line_total"] == 38.00 and p18["total_weight_g"] == 1000.0, p18)
 check("بلا ملاحظات دمج", r["merge_notes"] == [], r["merge_notes"])
+
+print("\n19) تاريخ الطلب — «Printed At» بصيغة اليوم أولاً")
+check("Printed At: 06-09-2026 ← 2026-09-06",
+      _norm_order_date("06-09-2026") == "2026-09-06", _norm_order_date("06-09-2026"))
+check("Printed At: 08-09-2026 01:12 AM ← 2026-09-08",
+      _norm_order_date("08-09-2026 01:12 AM") == "2026-09-08",
+      _norm_order_date("08-09-2026 01:12 AM"))
+check("27/08/2026 ← 2026-08-27",
+      _norm_order_date("27/08/2026") == "2026-08-27", _norm_order_date("27/08/2026"))
+check("صيغة ISO تبقى كما هي",
+      _norm_order_date("2026-09-06") == "2026-09-06", _norm_order_date("2026-09-06"))
+check("Today ليست تاريخاً", _norm_order_date("Today") is None, _norm_order_date("Today"))
+check("null / فراغ ← None",
+      _norm_order_date(None) is None and _norm_order_date("") is None
+      and _norm_order_date("null") is None)
+check("تاريخ مستحيل ← None",
+      _norm_order_date("32-13-2026") is None, _norm_order_date("32-13-2026"))
+check("نص بلا تاريخ ← None",
+      _norm_order_date("Printed At") is None, _norm_order_date("Printed At"))
+r = run([L(1, "Test Item R100", "R100", None, 10.00)], subtotal=10.00, total=10.00)
+check("normalize_result يعيد التاريخ موحّداً",
+      r["order_date"] == "2026-09-06", r["order_date"])
+r = normalize_result({
+    "order_code": None, "platform": "keeta", "branch": "Al Yasmin",
+    "order_date": "08-09-2026 01:12 AM", "items_count": 1,
+    "lines": [L(1, "Dried Fruits With Apricots and Prunes R584", "R584", None, 25.00),
+              L(1, "Dried fruits prunes Bukhara 500g", None, "500g", 25.00)],
+    "subtotal": 50.00, "delivery": 22.00, "delivery_printed": True, "total": 50.00,
+    "adjustments": None, "evidence_medium": "printed_receipt",
+    "field_confidence": {"order_code": "low", "platform": "high",
+                         "branch": "high", "order_total": "high"},
+})
+check("فاتورة qwf-5-1106: التاريخ 2026-09-08 لا فراغ",
+      r["order_date"] == "2026-09-08", r["order_date"])
+
 
 print("\n" + ("=" * 60))
 if FAILED:
