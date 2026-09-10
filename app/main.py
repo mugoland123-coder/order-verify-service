@@ -216,6 +216,38 @@ def _norm_branch(value):
     return s
 
 
+_DATE_ISO = re.compile(r"^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})")
+_DATE_DMY = re.compile(r"^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})")
+
+
+def _norm_order_date(value):
+    """يوحّد تاريخ الطلب إلى YYYY-MM-DD.
+
+    الفواتير تطبع التاريخ بصيغة اليوم أولاً (Printed At: 08-09-2026 = 8 سبتمبر)،
+    وبعض الشاشات تطبعه بصيغة ISO. أي شيء آخر أو تاريخ مستحيل يعود None،
+    فلا يُخزَّن تاريخ مخترع.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if s == "" or s.lower() in ("null", "none", "n/a", "unknown", "today"):
+        return None
+    s = re.sub(r"[\u200e\u200f\u202a-\u202e]", "", s).strip()
+
+    m = _DATE_ISO.match(s)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    else:
+        m = _DATE_DMY.match(s)
+        if not m:
+            return None
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+    if not (2000 <= y <= 2100) or not (1 <= mo <= 12) or not (1 <= d <= 31):
+        return None
+    return "%04d-%02d-%02d" % (y, mo, d)
+
+
 def _num(value):
     if value is None:
         return None
@@ -824,7 +856,7 @@ def normalize_result(parsed):
         "order_code": order_code,
         "platform": platform,
         "branch": branch,
-        "order_date": parsed.get("order_date") or None,
+        "order_date": _norm_order_date(parsed.get("order_date")),
         # order_total = مرجع أسعار المنتجات (بلا توصيل) وهو ما يُقارن بفاتورة سماك.
         "order_total": reference,
         "order_total_basis": ref_basis,
@@ -893,7 +925,12 @@ def analyze_with_claude(image_content_blocks: list[dict], invoice_text: str | No
         "لا تستنتج المنصة من شكل رقم الطلب إطلاقاً.\n"
         "- branch: الفرع أو المخزن الظاهر. القيم المتوقعة: Al Masiaf أو Al Wisham أو Al Khaleej "
         "أو Al Yasmin أو Dhahrat Laban، أو رمز المخزن من 0001 إلى 0005، أو null.\n"
-        "- order_date: تاريخ الطلب بصيغة YYYY-MM-DD إن ظهر، وإلا null.\n"
+        "- order_date: تاريخ الطلب. اقرأه من أي سطر تاريخ مطبوع على الفاتورة أو الشاشة: "
+        "Printed At أو Received at أو Order Date أو Date أو تاريخ الطباعة أو التاريخ. "
+        "هذه الأسطر تقع عادة في أعلى الفاتورة أو في أسفلها بعد سطر الشكر. "
+        "الصيغة المطبوعة عادة DD-MM-YYYY أي اليوم أولاً: 08-09-2026 تعني 8 سبتمبر 2026. "
+        "انسخه كما هو مطبوع بلا تحويل ولا تخمين (مع الوقت إن وجد). "
+        "ولا تضع كلمة Today مكان التاريخ. إن لم يُطبع أي تاريخ فضع null.\n"
         "- items_count: الرقم المطبوع في سطر مثل '3 Items' أو '2 أصناف' أعلى قائمة السطور، كرقم "
         "صحيح كما هو مطبوع. هذا عدد المنتجات لا عدد الحبات. null إن لم يُطبع.\n\n"
         "«lines» — قلب المهمة: انسخ كل سطر مطبوع في قائمة الطلب سطراً سطراً بالترتيب من أعلى إلى "
@@ -952,7 +989,7 @@ def analyze_with_claude(image_content_blocks: list[dict], invoice_text: str | No
         '{"order_code": "رقم الطلب أو null", '
         '"platform": "keeta|jahez|hunger|ninja|thechefz|marsool|toyou|unknown", '
         '"branch": "اسم الفرع أو رمز المخزن أو null", '
-        '"order_date": "YYYY-MM-DD أو null", '
+        '"order_date": "التاريخ كما هو مطبوع أو null", '
         '"items_count": "الرقم المطبوع في سطر N Items أو null", '
         '"lines": [{"qty": "الرقم في بداية السطر أو null", '
         '"name": "اسم الصنف كما هو مطبوع في هذا السطر", '
