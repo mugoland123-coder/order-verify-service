@@ -596,7 +596,7 @@ def _bottom_verdict(top, cur):
     """
     هل السطر الحالي خيار وزن للمنتج الذي فوقه، أم منتج مستقل؟
     القاعدة: كوده فارغ أو نفس كود العلوي + تطابق الاسم ≥ 0.85 + كميته 1X.
-    كود مختلف = منتج جديد قطعاً.
+    كود مختلف = منتج جديد قطعاً. وتشابه أقل من الحد يحتاج تأكيد «N Items».
     """
     ccode, pcode = cur.get("code"), top.get("code")
     if ccode and pcode and ccode != pcode:
@@ -617,9 +617,9 @@ def _bottom_verdict(top, cur):
         return "note", ("سطر خيار وزن كميته %s وليست 1X فلم يُدمج: «%s»"
                         % (cur.get("qty"), _line_label(cur)))
     if qty_ok and _has_weight_token(cur) and not _has_weight_token(top):
-        return "merge_if_money", (
-            "سطر وزن تشابه اسمه %.2f أقل من %.2f — لم يُدمج إلا بتأكيد المبلغ المطبوع: «%s»"
-            % (sim, _NAME_SIM_MIN, _line_label(cur)))
+        return "merge_if_count", (
+            "اسم السطر السفلي مختلف (تشابه %.2f) ولا يوجد عدد منتجات للتأكيد: «%s»"
+            % (sim, _line_label(cur)))
     if not ccode:
         return "note", ("سطر بلا كود R ولا يطابق اسم المنتج فوقه (تشابه %.2f): «%s»"
                         % (sim, _line_label(cur)))
@@ -667,12 +667,12 @@ def _finalize_product(top, bottom, notes):
     }
 
 
-def _assemble_products(lines, reference):
+def _assemble_products(lines, items_count):
     """
     يبني المنتجات من السطور المطبوعة حسب قواعد صاحبة النظام.
-    السطر الذي يُرفض دمجه يصبح منتجاً مستقلاً ويُسجَّل سببه في merge_notes.
-    الدمج الاحتياطي (تشابه اسم أقل من الحد) لا يُقبل إلا إذا جعل مجموع المنتجات
-    يساوي المرجع المطبوع — قرار حسابي، لا تخمين.
+    سطر بلا كود (أو بنفس كود العلوي) تشابه اسمه ≥ 0.85 وكميته 1X = خيار وزن يُدمج.
+    تشابه أقل من الحد لا يُدمج إلا إذا كان «N Items» مقروءاً ومطابقاً لعدد المنتجات بعد الدمج؛
+    وإن لم يكن مقروءاً فلا دمج، ويُسجَّل السبب صريحاً (المبلغ لا يميّز الدمج في منتج 1X).
     """
     plan, notes = [], []
     i, n = 0, len(lines)
@@ -682,7 +682,7 @@ def _assemble_products(lines, reference):
             verdict, note = _bottom_verdict(lines[i], lines[i + 1])
             if verdict == "merge":
                 bottom_idx = i + 1
-            elif verdict == "merge_if_money":
+            elif verdict == "merge_if_count":
                 bottom_idx, tentative = i + 1, True
                 notes.append(note)
             elif verdict == "note":
@@ -704,18 +704,14 @@ def _assemble_products(lines, reference):
         return prods_with, notes + notes_with
 
     prods_without, notes_without = build(False)
-
-    def total_of(rows):
-        vals = [_num(p.get("line_total")) for p in rows if _num(p.get("line_total")) is not None]
-        return round(sum(vals), 2) if vals else None
-
-    if reference is not None:
-        t_with, t_without = total_of(prods_with), total_of(prods_without)
-        if t_with is not None and abs(t_with - reference) <= _SELF_CHECK_TOL:
-            kept = [x for x in notes if "لم يُدمج إلا بتأكيد المبلغ المطبوع" not in x]
-            return prods_with, kept + notes_with
-        if t_without is not None and abs(t_without - reference) <= _SELF_CHECK_TOL:
-            return prods_without, notes + notes_without
+    if items_count is None:
+        # لا عدد منتجات مطبوع: لا دمج، والسبب يبقى ظاهراً فيسقط lines_merged_cleanly
+        return prods_without, notes + notes_without
+    if len(prods_with) == int(items_count):
+        kept = [x for x in notes if "ولا يوجد عدد منتجات للتأكيد" not in x]
+        return prods_with, kept + notes_with
+    if len(prods_without) == int(items_count):
+        return prods_without, notes + notes_without
     return prods_without, notes + notes_without
 
 
@@ -767,10 +763,10 @@ def normalize_result(parsed):
         printed_total = _num(parsed.get("order_total"))
     reference, ref_basis = _reference_sum(subtotal, delivery, delivery_printed, printed_total)
 
-    items, merge_notes = _assemble_products(raw_lines, reference)
-
     items_count = _num(parsed.get("items_count"))
     items_count = int(items_count) if items_count is not None else None
+
+    items, merge_notes = _assemble_products(raw_lines, items_count)
     adjustments = _norm_adjustments(parsed.get("adjustments"))
 
     order_code = parsed.get("order_code")
