@@ -707,6 +707,16 @@ def _norm_raw_line(raw):
         return None
     qty = _num(raw.get("qty") if raw.get("qty") is not None else raw.get("quantity"))
     value, unit = _norm_weight(raw)
+    if value is None:
+        # الوزن مطبوع داخل اسم السطر نفسه ("Yemeni Raisins 250g") ولم يملأه النموذج:
+        # يُقرأ من النص المطبوع لا يُخترع، فلا يضيع وزن البند لمجرد حقل فارغ.
+        for _key in ("name", "raw_name", "raw_text"):
+            _m = _WEIGHT_TOKEN.search(str(raw.get(_key) or ""))
+            if not _m:
+                continue
+            value, unit = _norm_weight({"weight": _m.group(0)})
+            if value is not None:
+                break
     price = _num(raw.get("price"))
     if price is None:
         price = _num(raw.get("line_total"))
