@@ -294,6 +294,135 @@ check('ملف مختلف لا يُعدّ مكرراً', !d.skip && d.cached === 
 d = decide({ id: 'old1', name: 'VID_20260910_023329.mp4', md5: 'M1', size: '68700000' }, savedOk, seenMd5, seenKey);
 check('الملف لا يُعدّ نسخة من نفسه', !d.skip && d.cached === true, d);
 
+
+// ===== 5) حالتان ثابتتان من القراءات المحفوظة 2026-09-10 (بلا API) =====
+// المصدر: سجل الاستخراج صف 93 (VID_20260910_211435 = qwd-5-1318) وصف 96 (20260910_125221 = qwd-5-1315)
+// وفواتير سماك من تقرير 09-10 كما قرأها «Split Invoices & Items (Samak)» في التشغيل 820.
+
+// نسخة حرفية من judgePrep في «Build Orders Table»
+function judgePrep(prep, billed, cov) {
+  cov = String(cov || 'none');
+  if (!billed.length) return { st: 'not_verifiable', why: '' };
+  if (!prep.length || cov === 'none') return { st: 'not_verifiable', why: 'لم تظهر أي عبوة بوضوح — تعذّر التحقق من التحضير' };
+  const pm = {}, noCode = [];
+  prep.forEach(function (p) {
+    if (!p.r_code) { noCode.push(p.item_name || ''); return; }
+    pm[p.r_code] = pm[p.r_code] || { n: 0, w: 0, name: p.item_name };
+    const n = Number(p.seen_count) || 1;
+    pm[p.r_code].n += n; pm[p.r_code].w += (Number(p.weight_g) || 0) * n;
+  });
+  const bm = {};
+  billed.forEach(function (b) {
+    if (!b.r_code) return;
+    bm[b.r_code] = bm[b.r_code] || { q: 0, w: 0, name: b.item_name, lines: 0 };
+    bm[b.r_code].q += Number(b.quantity) || 0;
+    bm[b.r_code].w += Number(b.weight_g) || 0;
+    bm[b.r_code].lines += 1;
+  });
+  const probs = [], unsure = [];
+  const canAssertMissing = (cov === 'full' && noCode.length === 0);
+  Object.keys(bm).forEach(function (k) {
+    const b = bm[k], p = pm[k];
+    if (!p) { if (canAssertMissing) probs.push(k + ' (' + (b.name || '') + ') مفوتر ولم يُحضَّر'); else unsure.push(k); return; }
+    if (b.w && p.w && Math.abs(p.w - b.w) > Math.max(2, Math.round(b.w * 0.05))) {
+      // وزن الملصق هو وزن العبوة الواحدة. إن كان المفوتر مضاعفاً صحيحاً لوزن العبوة
+      // (500جم = علبتان 250جم) فالفرق في عدد العبوات لا في الوزن، وعدّ العبوات بصريًا
+      // (seen_count) أضعف من أن يُتّهم به التحضير ⇒ «لم أتمكن من التحقق» لا «مخالفة».
+      const unit = (Number(p.n) > 0) ? (p.w / Number(p.n)) : p.w;
+      const mult = (unit > 0) ? (b.w / unit) : 0;
+      if (unit > 0 && b.w > p.w && Math.abs(mult - Math.round(mult)) < 1e-6 && Math.round(mult) >= 2) {
+        unsure.push(k + ': الفاتورة ' + b.w + 'جم = ' + Math.round(mult) + ' عبوة من ' + unit + 'جم ولم يظهر منها إلا ' + p.n);
+      } else {
+        probs.push(k + ': وزن المحضَّر ' + p.w + 'جم مقابل ' + b.w + 'جم بالفاتورة');
+      }
+    }
+  });
+  Object.keys(pm).forEach(function (k) { if (!bm[k]) probs.push(k + ' (' + (pm[k].name || '') + ') محضَّر وغير مفوتر'); });
+  if (noCode.length) unsure.push(noCode.length + ' عبوة بلا كود على الملصق');
+  if (probs.length) return { st: 'mismatch', why: probs.join(' ؛ ') };
+  if (unsure.length) return { st: 'not_verifiable', why: 'لم أتمكن من التحقق من: ' + unsure.join('، ') };
+  if (cov === 'full') return { st: 'matched', why: '' };
+  return { st: 'not_verifiable', why: 'التغطية جزئية — تحقق غير مكتمل' };
+}
+
+// نسخة حرفية من مقارنة الفيديو بسماك في «Build Orders Table»
+const TOL_LINE_R = 0.50;
+function compareLine(a, b, vHasMoney) {
+  const probs = [], notes = [];
+  const dp = Number((b.t - a.t).toFixed(2));
+  const priceOk = (!vHasMoney || !a.t) ? true : Math.abs(dp) <= TOL_LINE_R;
+  if (!priceOk) probs.push('سعر سماك ' + b.t.toFixed(2) + ' مقابل ' + a.t.toFixed(2) + ' بالفيديو');
+  const qf = Number(a.q) > 1 ? Number(a.q) : 0;
+  const wAmb = !!(qf && a.w && b.w && (Math.abs(a.w - b.w * qf) <= 1 || Math.abs(a.w * qf - b.w) <= 1));
+  const wOff = (a.w && b.w) && Math.abs(Math.round(b.w - a.w)) > Math.max(1, Math.round(a.w * 0.02)) && !(wAmb && priceOk);
+  const qOff = (a.q && b.q) && Math.abs(b.q - a.q) > 0.05;
+  if (wOff || qOff) {
+    const det = [];
+    if (qOff) det.push('عدد القطع ' + b.q + ' بسماك مقابل ' + a.q + ' بالفيديو');
+    if (wOff) det.push('الوزن الإجمالي ' + b.w + 'جم بسماك مقابل ' + a.w + 'جم بالفيديو');
+    probs.push((priceOk ? 'المبلغ مطابق لكن ' : '') + det.join(' و'));
+  }
+  return { probs: probs, notes: notes };
+}
+
+// --- البيانات المحفوظة حرفياً ---
+const PREP_1318 = [
+  { r_code: 'R71', item_name: 'فول سوداني ملكي', seen_count: 1, weight_g: 250 },
+  { r_code: 'R673', item_name: 'قضامة مالح', seen_count: 1, weight_g: 250 },
+  { r_code: 'R80', item_name: 'حب دوار الشمس مالح', seen_count: 1, weight_g: 250 },
+  { r_code: 'R75', item_name: 'متاي حار', seen_count: 1, weight_g: 250 },
+  { r_code: 'R76', item_name: 'مكسرات يابانية مشكلة', seen_count: 1, weight_g: 250 },
+  { r_code: 'R18', item_name: 'ذرة محمصة حار', seen_count: 1, weight_g: 250 },
+];
+// فاتورة سماك qwd-5-1318: سبعة سطور، R75 مرتين بـ0.25 كيلو لكل سطر
+const BILLED_1318 = [
+  { r_code: 'R18', item_name: 'ذرة محمصة حار  R18', quantity: 0.25, weight_g: 250 },
+  { r_code: 'R673', item_name: 'قضامة محمصة مالحة  R673', quantity: 0.25, weight_g: 250 },
+  { r_code: 'R80', item_name: 'حب دوار الشمس محمص مالح  R80', quantity: 0.25, weight_g: 250 },
+  { r_code: 'R76', item_name: 'مكسرات يابانية مشكلة  R76', quantity: 0.25, weight_g: 250 },
+  { r_code: 'R71', item_name: 'فول سوداني ملكي R71', quantity: 0.25, weight_g: 250 },
+  { r_code: 'R75', item_name: 'متاي حار R75', quantity: 0.25, weight_g: 250 },
+  { r_code: 'R75', item_name: 'متاي حار R75', quantity: 0.25, weight_g: 250 },
+];
+const PREP_1315 = [{ r_code: 'R373', item_name: 'صابون غار الأصلي', seen_count: 1, weight_g: 4000 }];
+const BILLED_1315 = [{ r_code: 'R373', item_name: 'صابون الغار الاصلي   R373', quantity: 4, weight_g: null }];
+
+console.log('\n20) qwd-5-1318 — علبتا R75 (250جم × 2 = 500جم) لا تُعدّ نقصاً في التحضير');
+let jp = judgePrep(PREP_1318, BILLED_1318, 'full');
+check('لا تُتّهم حالة التحضير بمخالفة', jp.st !== 'mismatch', jp);
+check('ولا يظهر «وزن المحضَّر 250جم مقابل 500جم بالفاتورة»',
+  !/وزن المحضَّر 250جم مقابل 500جم/.test(jp.why), jp.why);
+check('بل ملاحظة صريحة أن الفاتورة علبتان ولم تظهر إلا واحدة',
+  /R75: الفاتورة 500جم = 2 عبوة من 250جم ولم يظهر منها إلا 1/.test(jp.why), jp.why);
+check('فاتورة سماك فيها سطران لـR75 كل منهما 250جم',
+  BILLED_1318.filter(function (b) { return b.r_code === 'R75'; }).length === 2);
+check('بقية الأصناف الخمسة بلا أي ملاحظة',
+  !/R71|R673|R80|R76|R18/.test(jp.why), jp.why);
+
+console.log('\n21) qwd-5-1315 — صابونة واحدة لا تُعدّ أربعاً: ⚠️ تبقى ⚠️');
+jp = judgePrep(PREP_1315, BILLED_1315, 'full');
+check('فحص التحضير لا يتدخّل (الفاتورة بالحبة لا بالوزن)', jp.st === 'matched', jp);
+let cmp = compareLine({ q: 1, w: null, t: 40 }, { q: 4, w: null, t: 40 }, true);
+check('المقارنة مع سماك ترصد فرق العدد', cmp.probs.length === 1, cmp);
+check('بالنص الحرفي «المبلغ مطابق لكن عدد القطع 4 بسماك مقابل 1 بالفيديو»',
+  cmp.probs[0] === 'المبلغ مطابق لكن عدد القطع 4 بسماك مقابل 1 بالفيديو', cmp.probs[0]);
+check('القاعدة الجديدة لا تمسّها: b.w فارغ فلا يعمل فرع الوزن أصلاً',
+  BILLED_1315[0].weight_g === null);
+
+console.log('\n22) القاعدة الجديدة ضيّقة: لا تبتلع فروقاً حقيقية');
+check('300جم مقابل علبة 250جم (ليس مضاعفاً) يبقى مخالفة',
+  judgePrep([{ r_code: 'R9', seen_count: 1, weight_g: 250 }],
+            [{ r_code: 'R9', quantity: 0.3, weight_g: 300 }], 'full').st === 'mismatch');
+check('محضَّر أكثر من المفوتر يبقى مخالفة',
+  judgePrep([{ r_code: 'R9', seen_count: 4, weight_g: 250 }],
+            [{ r_code: 'R9', quantity: 0.25, weight_g: 250 }], 'full').st === 'mismatch');
+check('صنف مفوتر لم يُحضَّر إطلاقاً يبقى مخالفة',
+  judgePrep([{ r_code: 'R9', seen_count: 1, weight_g: 250 }],
+            [{ r_code: 'R9', quantity: 0.25, weight_g: 250 }, { r_code: 'R8', quantity: 0.25, weight_g: 250 }], 'full').st === 'mismatch');
+check('750جم = ثلاث علب 250جم ⇒ ملاحظة لا مخالفة',
+  judgePrep([{ r_code: 'R9', seen_count: 1, weight_g: 250 }],
+            [{ r_code: 'R9', quantity: 0.75, weight_g: 750 }], 'full').st === 'not_verifiable');
+
 console.log('\n' + '='.repeat(60));
 if (failed) { console.log('سقطت ' + failed + ' حالة'); process.exit(1); }
 console.log('كل الاختبارات نجحت ✅');
