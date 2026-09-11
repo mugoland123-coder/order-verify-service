@@ -1,12 +1,91 @@
-import os, re, subprocess, tempfile, base64, json, difflib
+import os, re, subprocess, tempfile, base64, json, difflib, time
 from pathlib import Path
 import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
-from anthropic import Anthropic
+from anthropic import (
+    Anthropic,
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+)
 
 app = FastAPI()
-client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+
+# مهلة صريحة لكل نداء + إلغاء إعادة المحاولة الداخلية للمكتبة:
+# إعادة المحاولة تُدار هنا (محاولة واحدة بعد 60 ثانية) حتى لا تمتد القراءة
+# الواحدة إلى 25 دقيقة كما حدث في 2026-09-11 فيقطع n8n الاتصال ويسقط التشغيل.
+_READ_TIMEOUT_S = float(os.environ.get("CLAUDE_READ_TIMEOUT_S", "180"))
+_RETRY_WAIT_S = float(os.environ.get("CLAUDE_RETRY_WAIT_S", "60"))
+
+# مهلة رقمية عادية (لا كائن Timeout) حتى تعمل مع أي إصدار من مكتبة anthropic.
+client = Anthropic(
+    api_key=os.environ["ANTHROPIC_API_KEY"],
+    max_retries=0,
+    timeout=_READ_TIMEOUT_S,
+)
+
+
+class ClaudeReadError(Exception):
+    """فشل قراءة من واجهة Claude بعد محاولة واحدة إضافية."""
+
+    MAX_MESSAGE = 320
+
+    def __init__(self, kind: str, message: str, retryable: bool):
+        text = " ".join(str(message).split())
+        if len(text) > self.MAX_MESSAGE:
+            text = text[: self.MAX_MESSAGE] + "\u2026"
+        super().__init__(text)
+        self.kind = kind
+        self.message = text
+        self.retryable = retryable
+
+
+def _classify_claude_error(exc: Exception) -> tuple[str, bool]:
+    """يعيد (نوع الخطأ، هل يستحق إعادة محاولة)."""
+    if isinstance(exc, APITimeoutError):
+        return "api_timeout", True
+    if isinstance(exc, APIConnectionError):
+        return "api_connection", True
+    if isinstance(exc, APIStatusError):
+        status = getattr(exc, "status_code", 0) or 0
+        if status == 429:
+            return "api_rate_limit", True
+        if status >= 500:
+            return "api_5xx", True
+        text = str(exc).lower()
+        if "credit balance" in text or "insufficient" in text:
+            return "api_credit", False
+        return "api_status_%d" % status, False
+    return "api_other", False
+
+
+def _short_error(exc: Exception, kind: str) -> str:
+    text = " ".join(str(exc).split())
+    if len(text) > 300:
+        text = text[:300] + "…"
+    return "%s: %s" % (kind, text)
+
+
+def _call_claude(content: list[dict]):
+    """نداء واحد لـ Claude مع إعادة محاولة واحدة بعد 60 ثانية للأخطاء العابرة."""
+    last_kind, last_exc = "api_other", None
+    for attempt in (1, 2):
+        try:
+            return client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=6000,
+                temperature=0,
+                messages=[{"role": "user", "content": content}],
+            )
+        except Exception as exc:  # noqa: BLE001 — نُصنّف ثم نرفع خطأً نظيفاً
+            kind, retryable = _classify_claude_error(exc)
+            last_kind, last_exc = kind, exc
+            if attempt == 1 and retryable:
+                time.sleep(_RETRY_WAIT_S)
+                continue
+            raise ClaudeReadError(kind, _short_error(exc, kind), retryable) from None
+    raise ClaudeReadError(last_kind, _short_error(last_exc, last_kind), False)
 
 def extract_first_json_object(text: str) -> str | None:
     """
@@ -1022,12 +1101,7 @@ def analyze_with_claude(image_content_blocks: list[dict], invoice_text: str | No
 
     content.append({"type": "text", "text": prompt})
 
-    msg = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=6000,
-        temperature=0,
-        messages=[{"role": "user", "content": content}]
-    )
+    msg = _call_claude(content)
 
     raw = msg.content[0].text.strip()
 
@@ -1041,6 +1115,18 @@ def analyze_with_claude(image_content_blocks: list[dict], invoice_text: str | No
         parsed = {"raw_response": raw}
 
     return {"status": "ok", "result": normalize_result(parsed)}
+
+def _read_failed_response(exc: "ClaudeReadError") -> dict:
+    """رد نظيف بحالة 200 حتى يستطيع n8n تسجيل «فشل القراءة» والانتقال للملف التالي
+    بدل أن يقطع الاتصال ويسقط الدفعة كلها."""
+    return {
+        "status": "read_failed",
+        "result": None,
+        "error_kind": exc.kind,
+        "error": "فشل القراءة: " + exc.message,
+        "retryable": bool(exc.retryable),
+    }
+
 
 @app.post("/verify-order")
 def verify_order(req: VerifyRequest):
@@ -1064,6 +1150,8 @@ def verify_order(req: VerifyRequest):
                     "source": {"type": "base64", "media_type": image_media_type, "data": img_b64}
                 }]
                 return analyze_with_claude(image_content, req.invoice_text)
+            except ClaudeReadError as exc:
+                return _read_failed_response(exc)
             except Exception:
                 return {
                     "status": "extraction_failed",
@@ -1100,7 +1188,10 @@ def verify_order(req: VerifyRequest):
                 "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}
             })
 
-        return analyze_with_claude(content, req.invoice_text)
+        try:
+            return analyze_with_claude(content, req.invoice_text)
+        except ClaudeReadError as exc:
+            return _read_failed_response(exc)
 
 @app.get("/health")
 def health():
