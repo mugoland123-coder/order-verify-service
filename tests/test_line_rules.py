@@ -367,6 +367,28 @@ check("رسالة الخطأ مقصوصة إلى 300 حرفاً كحد أقصى"
 check("مكتبة anthropic لا تعيد المحاولة داخلياً (نحن نديرها)",
       svc.client.max_retries == 0 if hasattr(svc.client, "max_retries") else True)
 
+
+print("\n21) وزن مطبوع داخل اسم السطر ولم يملأه النموذج — يُقرأ لا يُخترع")
+r = run([{"qty": 4, "name": "Yemeni Raisins 250g", "code": "R567",
+          "weight": None, "price": 20.00,
+          "raw_text": "Yemeni Raisins 250g SKU: R567 SAR 20.00"}],
+        subtotal=80.00, total=80.00)
+p21 = prod(r, "R567")
+check("الوزن الكلي 1000جم (4 × 250جم)", p21["total_weight_g"] == 1000.0, p21)
+check("لا يسقط فحص الأوزان", "all_weights" not in r["self_check"]["failed"], r["self_check"]["failed"])
+r = run([{"qty": 1, "name": "Original Laurel Soap", "code": "R373",
+          "weight": None, "price": 40.00,
+          "raw_text": "1X Original Laurel Soap R373"}],
+        subtotal=40.00, total=40.00)
+p21b = prod(r, "R373")
+check("سطر بلا أي وزن مطبوع يبقى بلا وزن — لا اختلاق",
+      p21b["total_weight_g"] is None, p21b)
+check("والفحص يرصده", "all_weights" in r["self_check"]["failed"], r["self_check"]["failed"])
+check("وزن مكتوب صراحة لا يُستبدل بما في الاسم",
+      prod(run([{"qty": 1, "name": "Nuts 250g", "code": "R9", "weight": "500g",
+                 "price": 30.00, "raw_text": "Nuts 250g"}], subtotal=30.0, total=30.0),
+           "R9")["total_weight_g"] == 500.0)
+
 print("\n" + ("=" * 60))
 if FAILED:
     print("سقطت %d حالة: %s" % (len(FAILED), " | ".join(FAILED)))
