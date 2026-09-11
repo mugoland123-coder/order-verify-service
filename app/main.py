@@ -134,6 +134,11 @@ class VerifyRequest(BaseModel):
     video_url: str
     invoice_text: str | None = None
     blind_count: bool = False
+    # الفحص الثاني المركّز: كود واحد وسؤال واحد، بلا فاتورة وبلا عدد متوقّع.
+    count_code: str | None = None
+    # أرقام الإطارات (1-based) التي ظهر فيها هذا الكود في القراءة الأولى.
+    # فارغة أو غير موجودة ⇒ تُرسل كل الإطارات.
+    count_frames: list[int] | None = None
 
 class FFmpegExtractionError(Exception):
     """يُرفع عند فشل ffmpeg تقنياً أثناء استخراج إطارات فيديو معيّن."""
@@ -1023,6 +1028,100 @@ _COUNT_PROTOCOL = (
 )
 
 
+def _count_only_prompt(code: str) -> str:
+    """برومبت الفحص الثاني المركّز: سؤال واحد عن كود واحد.
+
+    أعمى بشرط صاحبة النظام: لا فاتورة، ولا عدد متوقّع، ولا أي تلميح إلى أن
+    هناك خلافاً أصلاً — وإلا صار النموذج يؤكد ما نريده لا ما يراه.
+    """
+    return (
+        "أنت تنظر إلى إطارات من فيديو تحضير طلب. كل إطار مسبوق بسطر «إطار i — الثانية t».\n\n"
+        "سؤال واحد فقط، لا شيء غيره:\n"
+        "«كم عبوة منفصلة تحمل الكود " + code + " تظهر معاً في نفس الإطار؟»\n\n"
+        "الطريقة، بالترتيب حرفياً:\n"
+        "1) لكل إطار على حدة: اسرد ملصقات هذا الكود وحده الظاهرة فيه، مع موضع كل ملصق "
+        "(أعلى / أسفل / يمين / يسار / وسط، ويجوز الجمع مثل «أعلى يمين»). "
+        "تجاهل كل كود آخر تماماً.\n"
+        "2) الجواب = أكبر عدد ملصقات منفصلة لهذا الكود ظهرت معاً في إطار واحد. "
+        "لا تجمع عبر الإطارات: العبوة نفسها تظهر في عشرات الإطارات.\n"
+        "3) ملصقان متطابقان في موضعين مختلفين من نفس الإطار = عبوتان، "
+        "حتى لو تطابق كل شيء فيهما (الكود والاسم والوزن والباركود).\n"
+        "4) لا تخترع عبوة لم ترَ ملصقها. ليس لديك فاتورة ولا عدد متوقّع، "
+        "ولا يجوز أن تستنتج العدد من سطور فاتورة مطبوعة داخل الفيديو.\n"
+        "5) إن لم تستطع الحسم (ملصق محجوب أو غير مقروء أو الكود لم يظهر أصلاً) "
+        "فضع confidence = \"low\" وقل السبب في note — الحسم المتردد أسوأ من لا حسم.\n\n"
+        "أعد JSON فقط بلا أي نص آخر:\n"
+        '{"code": "' + code + '", "count": عدد صحيح, "confidence": "high|medium|low", '
+        '"per_frame": [{"frame": رقم الإطار, "count": عدد الملصقات في هذا الإطار, '
+        '"positions": ["أعلى يمين", "أسفل يسار"]}], "note": "سبب مختصر أو null"}'
+    )
+
+
+def _norm_count_only(parsed: dict, code: str) -> dict:
+    """تطبيع رد الفحص المركّز: العدد رقم صحيح ≥ 0 أو None، والثقة من ثلاث قيم."""
+    raw_count = parsed.get("count")
+    try:
+        count = int(float(str(raw_count).strip()))
+    except (TypeError, ValueError):
+        count = None
+    if count is not None and count < 0:
+        count = None
+
+    conf = str(parsed.get("confidence") or "").strip().lower()
+    if conf not in ("high", "medium", "low"):
+        conf = "low"
+    # عدد غير مقروء لا يجوز أن يخرج بثقة عالية.
+    if count is None:
+        conf = "low"
+
+    per_frame = []
+    for row in (parsed.get("per_frame") or []):
+        if not isinstance(row, dict):
+            continue
+        try:
+            fr = int(float(str(row.get("frame")).strip()))
+        except (TypeError, ValueError):
+            fr = None
+        try:
+            fc = int(float(str(row.get("count")).strip()))
+        except (TypeError, ValueError):
+            fc = None
+        positions = row.get("positions")
+        if not isinstance(positions, list):
+            positions = []
+        per_frame.append({"frame": fr, "count": fc,
+                          "positions": [str(x) for x in positions if x]})
+
+    note = parsed.get("note")
+    return {
+        "code": code,
+        "count": count,
+        "confidence": conf,
+        "per_frame": per_frame,
+        "note": (str(note) if note not in (None, "", "null") else None),
+    }
+
+
+def count_code_only(image_content_blocks: list[dict], code: str) -> dict:
+    """الفحص الثاني المركّز — استدعاء واحد، كود واحد، بلا فاتورة وبلا متوقّع."""
+    content = list(image_content_blocks)
+    content.append({"type": "text", "text": _count_only_prompt(code)})
+
+    msg = _call_claude(content)
+    raw = msg.content[0].text.strip()
+    extracted = extract_first_json_object(raw)
+    if extracted is not None:
+        raw = extracted
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    return {"status": "count_only", "result": _norm_count_only(parsed, code)}
+
+
 def analyze_with_claude(image_content_blocks: list[dict], invoice_text: str | None,
                         blind_count: bool = False) -> dict:
     """
@@ -1209,6 +1308,8 @@ def verify_order(req: VerifyRequest):
                     "type": "image",
                     "source": {"type": "base64", "media_type": image_media_type, "data": img_b64}
                 }]
+                if req.count_code:
+                    return count_code_only(image_content, req.count_code)
                 return analyze_with_claude(image_content, req.invoice_text,
                                             blind_count=req.blind_count)
             except ClaudeReadError as exc:
@@ -1240,9 +1341,27 @@ def verify_order(req: VerifyRequest):
         if not selected_frames:
             return {"status": "error", "reason": "no_frames_extracted"}
 
+        # الفحص الثاني المركّز: لقطات ذلك الكود فقط (كما رُصدت في القراءة الأولى)
+        # مع جاريها، فيبقى السؤال على نفس المشهد ولا يُشترى الفيديو كله مرة ثانية.
+        if req.count_code:
+            wanted = set()
+            for n in (req.count_frames or []):
+                try:
+                    i = int(n)
+                except (TypeError, ValueError):
+                    continue
+                for j in (i - 1, i, i + 1):
+                    if j >= 1:
+                        wanted.add(j)
+            if wanted:
+                picked = [fp for fp in selected_frames
+                          if (_frame_index(fp) is not None and (_frame_index(fp) + 1) in wanted)]
+                if picked:
+                    selected_frames = picked
+
         content = []
         for fp in selected_frames:
-            if req.blind_count:
+            if req.blind_count or req.count_code:
                 # ترقيم صريح لكل إطار مع ثانيته، حتى يستطيع النموذج أن ينسب كل ملصق
                 # إلى إطاره وحده فلا يجمع نفس العبوة عبر عشرات الإطارات.
                 idx = _frame_index(fp)
@@ -1257,6 +1376,8 @@ def verify_order(req: VerifyRequest):
             })
 
         try:
+            if req.count_code:
+                return count_code_only(content, req.count_code)
             return analyze_with_claude(content, req.invoice_text,
                                        blind_count=req.blind_count)
         except ClaudeReadError as exc:
