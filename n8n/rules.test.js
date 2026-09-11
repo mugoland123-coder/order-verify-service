@@ -319,7 +319,7 @@ function judgePrep(prep, billed, cov) {
     bm[b.r_code].w += Number(b.weight_g) || 0;
     bm[b.r_code].lines += 1;
   });
-  const probs = [], unsure = [];
+  const probs = [], unsure = [], review = [];
   const canAssertMissing = (cov === 'full' && noCode.length === 0);
   Object.keys(bm).forEach(function (k) {
     const b = bm[k], p = pm[k];
@@ -331,7 +331,7 @@ function judgePrep(prep, billed, cov) {
       const unit = (Number(p.n) > 0) ? (p.w / Number(p.n)) : p.w;
       const mult = (unit > 0) ? (b.w / unit) : 0;
       if (unit > 0 && b.w > p.w && Math.abs(mult - Math.round(mult)) < 1e-6 && Math.round(mult) >= 2) {
-        unsure.push(k + ': الفاتورة ' + b.w + 'جم = ' + Math.round(mult) + ' عبوة من ' + unit + 'جم ولم يظهر منها إلا ' + p.n);
+        review.push(k + ': الفاتورة ' + b.w + 'جم = ' + Math.round(mult) + ' عبوة من ' + unit + 'جم ولم يظهر منها إلا ' + p.n);
       } else {
         probs.push(k + ': وزن المحضَّر ' + p.w + 'جم مقابل ' + b.w + 'جم بالفاتورة');
       }
@@ -340,6 +340,7 @@ function judgePrep(prep, billed, cov) {
   Object.keys(pm).forEach(function (k) { if (!bm[k]) probs.push(k + ' (' + (pm[k].name || '') + ') محضَّر وغير مفوتر'); });
   if (noCode.length) unsure.push(noCode.length + ' عبوة بلا كود على الملصق');
   if (probs.length) return { st: 'mismatch', why: probs.join(' ؛ ') };
+  if (review.length) return { st: 'needs_review', why: review.join(' ؛ ') };
   if (unsure.length) return { st: 'not_verifiable', why: 'لم أتمكن من التحقق من: ' + unsure.join('، ') };
   if (cov === 'full') return { st: 'matched', why: '' };
   return { st: 'not_verifiable', why: 'التغطية جزئية — تحقق غير مكتمل' };
@@ -384,16 +385,31 @@ const BILLED_1318 = [
   { r_code: 'R75', item_name: 'متاي حار R75', quantity: 0.25, weight_g: 250 },
   { r_code: 'R75', item_name: 'متاي حار R75', quantity: 0.25, weight_g: 250 },
 ];
+// نفس القراءة بعد بروتوكول العدّ الأعمى (التشغيل 836): R75 عبوتان بدليل الإطار 29 / الثانية 14.335
+const PREP_1318_AFTER = PREP_1318.map(function (p) {
+  return p.r_code === 'R75' ? { r_code: 'R75', item_name: 'متاي حار', seen_count: 2, weight_g: 250 } : p;
+});
 const PREP_1315 = [{ r_code: 'R373', item_name: 'صابون غار الأصلي', seen_count: 1, weight_g: 4000 }];
 const BILLED_1315 = [{ r_code: 'R373', item_name: 'صابون الغار الاصلي   R373', quantity: 4, weight_g: null }];
 
-console.log('\n20) qwd-5-1318 — علبتا R75 (250جم × 2 = 500جم) لا تُعدّ نقصاً في التحضير');
-let jp = judgePrep(PREP_1318, BILLED_1318, 'full');
-check('لا تُتّهم حالة التحضير بمخالفة', jp.st !== 'mismatch', jp);
-check('ولا يظهر «وزن المحضَّر 250جم مقابل 500جم بالفاتورة»',
-  !/وزن المحضَّر 250جم مقابل 500جم/.test(jp.why), jp.why);
-check('بل ملاحظة صريحة أن الفاتورة علبتان ولم تظهر إلا واحدة',
-  /R75: الفاتورة 500جم = 2 عبوة من 250جم ولم يظهر منها إلا 1/.test(jp.why), jp.why);
+// دالة تحويل حكم التحضير إلى حالة الصف، كما في judge() في «Build Orders Table»
+function prepToStatus(st) {
+  if (st === 'mismatch') return '📦';
+  if (st === 'needs_review') return '🔍';
+  return '✅';
+}
+
+console.log('\n20) qwd-5-1318 — القراءة الصحيحة: علبتان R75، وشبكة الأمان 🔍 لا ✅');
+// (أ) القراءة الصحيحة بعد بروتوكول العدّ: R75 عبوتان ⇒ الوزن مطابق تماماً ولا ملاحظة وزن
+let jp = judgePrep(PREP_1318_AFTER, BILLED_1318, 'full');
+check('العدّ الصحيح (عبوتان) ⇒ لا مخالفة ولا ملاحظة وزن', jp.st === 'matched' && !jp.why, jp);
+check('وحالة الصف ✅', prepToStatus(jp.st) === '✅', jp);
+// (ب) شبكة الأمان: لو عاد العدّ واحداً والفاتورة علبتان ⇒ 🔍 لا ✅ ولا 📦
+jp = judgePrep(PREP_1318, BILLED_1318, 'full');
+check('عبوة واحدة مقابل علبتين ⇒ needs_review', jp.st === 'needs_review', jp);
+check('وحالة الصف 🔍 لا ✅', prepToStatus(jp.st) === '🔍', jp);
+check('بالسبب صريحاً', /R75: الفاتورة 500جم = 2 عبوة من 250جم ولم يظهر منها إلا 1/.test(jp.why), jp.why);
+check('ولا يُتّهم بوزن مختلف', !/وزن المحضَّر 250جم مقابل 500جم/.test(jp.why), jp.why);
 check('فاتورة سماك فيها سطران لـR75 كل منهما 250جم',
   BILLED_1318.filter(function (b) { return b.r_code === 'R75'; }).length === 2);
 check('بقية الأصناف الخمسة بلا أي ملاحظة',
@@ -419,9 +435,12 @@ check('محضَّر أكثر من المفوتر يبقى مخالفة',
 check('صنف مفوتر لم يُحضَّر إطلاقاً يبقى مخالفة',
   judgePrep([{ r_code: 'R9', seen_count: 1, weight_g: 250 }],
             [{ r_code: 'R9', quantity: 0.25, weight_g: 250 }, { r_code: 'R8', quantity: 0.25, weight_g: 250 }], 'full').st === 'mismatch');
-check('750جم = ثلاث علب 250جم ⇒ ملاحظة لا مخالفة',
+check('750جم = ثلاث علب 250جم ⇒ 🔍 لا ✅ ولا 📦',
   judgePrep([{ r_code: 'R9', seen_count: 1, weight_g: 250 }],
-            [{ r_code: 'R9', quantity: 0.75, weight_g: 750 }], 'full').st === 'not_verifiable');
+            [{ r_code: 'R9', quantity: 0.75, weight_g: 750 }], 'full').st === 'needs_review');
+check('ولا تصبح ✅ أبداً',
+  prepToStatus(judgePrep([{ r_code: 'R9', seen_count: 1, weight_g: 250 }],
+            [{ r_code: 'R9', quantity: 0.75, weight_g: 750 }], 'full').st) === '🔍');
 
 console.log('\n' + '='.repeat(60));
 if (failed) { console.log('سقطت ' + failed + ' حالة'); process.exit(1); }
