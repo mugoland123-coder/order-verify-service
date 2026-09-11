@@ -389,6 +389,42 @@ check("وزن مكتوب صراحة لا يُستبدل بما في الاسم",
                  "price": 30.00, "raw_text": "Nuts 250g"}], subtotal=30.0, total=30.0),
            "R9")["total_weight_g"] == 500.0)
 
+print("\n22) الفحص الثاني المركّز — أعمى، وكود واحد، ولا يُحسم بثقة واهية")
+_cp = svc._count_only_prompt("R75")
+check("السؤال بنصّه المطلوب",
+      "كم عبوة منفصلة تحمل الكود R75 تظهر معاً في نفس الإطار؟" in _cp, _cp[:200])
+check("لا ذكر للفاتورة ولا للعدد المتوقّع",
+      ("فاتورة مرجعية" not in _cp) and ("العدد المتوقع" not in _cp)
+      and ("ليس لديك فاتورة ولا عدد متوقّع" in _cp))
+check("يمنع الجمع عبر الإطارات",
+      "لا تجمع عبر الإطارات" in _cp)
+check("ملصقان في موضعين = عبوتان",
+      "= عبوتان" in _cp)
+check("كود واحد فقط: يُطلب تجاهل ما عداه",
+      "تجاهل كل كود آخر" in _cp)
+
+_c = svc._norm_count_only({"count": "2", "confidence": "high",
+                           "per_frame": [{"frame": "7", "count": "2",
+                                          "positions": ["أعلى يمين", "أسفل"]}],
+                           "note": None}, "R75")
+check("عدد نصّي يصير رقماً صحيحاً", _c["count"] == 2, _c)
+check("الكود يعود كما طُلب لا كما قاله النموذج", _c["code"] == "R75", _c)
+check("per_frame مطبَّع", _c["per_frame"][0]["frame"] == 7
+      and _c["per_frame"][0]["count"] == 2, _c)
+_c2 = svc._norm_count_only({"count": None, "confidence": "high"}, "R75")
+check("عدد غير مقروء لا يخرج بثقة عالية أبداً",
+      _c2["count"] is None and _c2["confidence"] == "low", _c2)
+_c3 = svc._norm_count_only({"count": "غير واضح", "confidence": "منخفضة"}, "R75")
+check("قيمة غير رقمية = لا عدد، وثقة غير معروفة تُعامل low",
+      _c3["count"] is None and _c3["confidence"] == "low", _c3)
+check("عدد سالب مرفوض", svc._norm_count_only({"count": -1}, "R9")["count"] is None)
+check("رد فارغ تماماً لا يُسقط الدالة",
+      svc._norm_count_only({}, "R9")["confidence"] == "low")
+
+_vr = svc.VerifyRequest(video_url="u")
+check("count_code افتراضياً معطّل — لا يتغيّر سلوك القراءة العادية",
+      _vr.count_code is None and _vr.count_frames is None and _vr.blind_count is False, _vr)
+
 print("\n" + ("=" * 60))
 if FAILED:
     print("سقطت %d حالة: %s" % (len(FAILED), " | ".join(FAILED)))
