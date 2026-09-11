@@ -595,6 +595,85 @@ check('كود لم يُرَ في القراءة يُضاف بندَ عبوات �
       ap.item.result.prepared_items.length === 2
       && ap.item.result.prepared_items[1].seen_count === 2, ap.item.result.prepared_items);
 
+// ===== 7) تغطية سماك بالتاريخ والفرع معاً + بقاء نقص العبوات في السبب =====
+const BR = [['0001','Al Masiaf','المصيف'],['0002','Al Wisham','الوشم'],['0003','Al Khaleej','الخليج'],
+            ['0004','Al Yasmin','الياسمين'],['0005','Dhahrat Laban','ظهرة لبن']];
+function makeCov(freshInv){
+  const SAMAK_DAYS={}, SAMAK_COV={};
+  (freshInv||[]).forEach(function(v){ const dd=String(v.date||'').trim(); if(!dd) return; SAMAK_DAYS[dd]=1;
+    const bc=String(v.branch_code||'').trim(); if(bc) SAMAK_COV[dd+'|'+bc]=1; });
+  function dayHas(dd,bc){ if(!SAMAK_DAYS[dd]) return false; if(!bc) return true; return !!SAMAK_COV[dd+'|'+bc]; }
+  function brAr(bc){ const r=BR.filter(function(b){ return b[0]===bc; })[0]; return r?r[2]:''; }
+  function waitWhy(d,bc,bn){ const dd=String(d||'').trim();
+    return bc ? ('بانتظار تقرير سماك لفرع '+(bn||bc)+' ليوم '+dd) : ('بانتظار تقرير سماك ليوم '+dd); }
+  function samakDayLoaded(d,bc){ const s=String(d||'').trim(); if(!s) return true;
+    const t=Date.parse(s+'T00:00:00Z'); if(isNaN(t)) return true;
+    if(bc) return dayHas(s,bc);
+    for(let k=-1;k<=1;k++){ const dd=new Date(t+k*86400000).toISOString().slice(0,10); if(dayHas(dd,bc)) return true; }
+    return false; }
+  function samakWindowLoaded(d,bc){ const s2=String(d||'').trim(); if(!s2) return false;
+    const t2=Date.parse(s2+'T00:00:00Z'); if(isNaN(t2)) return false;
+    for(let k=-1;k<=1;k++){ const dd=new Date(t2+k*86400000).toISOString().slice(0,10); if(!dayHas(dd,bc)) return false; }
+    return true; }
+  return { samakDayLoaded:samakDayLoaded, samakWindowLoaded:samakWindowLoaded, waitWhy:waitWhy, brAr:brAr };
+}
+
+// التقارير المحمَّلة فعلاً في 2026-09-12 (مقيسة من تشغيل حقيقي):
+// 09-10 الخليج فقط · 09-09 الخليج فقط · 09-08 الفروع الخمسة · 08-27 الخمسة · 08-28 الياسمين فقط
+const FRESH = [].concat(
+  [{date:'2026-09-10',branch_code:'0003'}],
+  [{date:'2026-09-09',branch_code:'0003'}],
+  ['0001','0002','0003','0004','0005'].map(function(b){ return {date:'2026-09-08',branch_code:b}; }),
+  ['0001','0002','0003','0004','0005'].map(function(b){ return {date:'2026-08-27',branch_code:b}; }),
+  [{date:'2026-08-28',branch_code:'0004'}]);
+const CV = makeCov(FRESH);
+
+console.log('\n25) 🚨 لا تُعلن إلا إذا كان التقرير يغطي التاريخ والفرع معاً');
+check('الخليج 09-09 مغطى ⇒ البوابة مفتوحة', CV.samakDayLoaded('2026-09-09','0003') === true);
+check('الياسمين 09-09 غير مغطى ⇒ لا 🚨', CV.samakDayLoaded('2026-09-09','0004') === false);
+check('وتغطية الياسمين في اليوم المجاور (09-08) لا تكفي',
+      CV.samakDayLoaded('2026-09-09','0004') === false);
+check('الياسمين 09-08 مغطى ⇒ البوابة مفتوحة', CV.samakDayLoaded('2026-09-08','0004') === true);
+check('ظهرة لبن 08-28 غير مغطى ⇒ لا 🚨', CV.samakDayLoaded('2026-08-28','0005') === false);
+check('يوم بلا أي تقرير يبقى غير مغطى لكل الفروع',
+      CV.samakDayLoaded('2026-09-01','0003') === false);
+check('فرع غير مقروء يرجع للقاعدة القديمة (تاريخ ±يوم)',
+      CV.samakDayLoaded('2026-09-09','') === true);
+check('وبلا تاريخ مقروء لا تُمنع 🚨 كما كان', CV.samakDayLoaded('','0004') === true);
+
+console.log('\n26) نص الانتظار يسمّي الفرع، وبلا فرع يبقى كما كان');
+check('بالفرع', CV.waitWhy('2026-09-09','0004',CV.brAr('0004'))
+      === 'بانتظار تقرير سماك لفرع الياسمين ليوم 2026-09-09');
+check('بلا فرع', CV.waitWhy('2026-09-09','','')
+      === 'بانتظار تقرير سماك ليوم 2026-09-09');
+check('اسم الفرع عربي لا إنجليزي', CV.brAr('0003') === 'الخليج');
+check('كود مجهول لا يكسر النص', CV.waitWhy('2026-09-09','0009','') === 'بانتظار تقرير سماك لفرع 0009 ليوم 2026-09-09');
+
+console.log('\n27) التاريخ التقديري يشترط الأيام الثلاثة لنفس الفرع');
+check('الخليج: 09-08 و09-09 و09-10 كلها مغطاة ⇒ نافذة مكتملة',
+      CV.samakWindowLoaded('2026-09-09','0003') === true);
+check('الياسمين: 09-09 و09-10 غير مغطيين ⇒ نافذة ناقصة',
+      CV.samakWindowLoaded('2026-09-09','0004') === false);
+check('الخليج 08-27: يوم 08-26 غير محمّل ⇒ نافذة ناقصة',
+      CV.samakWindowLoaded('2026-08-27','0003') === false);
+
+console.log('\n28) نقص العبوات يبقى في السبب حتى مع مخالفة وزن أخرى');
+function prepWhy(probs, review, okNotes){
+  // نفس ترتيب judgePrep بعد الإصلاح
+  if(probs.length) return { st:'mismatch', why:probs.concat(review).join(' ؛ ') };
+  if(review.length) return { st:'needs_review', why:okNotes.concat(review).join(' ؛ ') };
+  return { st:'matched', why:okNotes.join(' ؛ ') };
+}
+let pw = prepWhy(['R248: وزن المحضَّر 500جم مقابل 1000جم بالفاتورة'],
+                 ['R247: الفاتورة 1000جم = 2 عبوة من 500جم ولم يظهر منها إلا 1'], []);
+check('الحالة تبقى مخالفة', pw.st === 'mismatch', pw);
+check('ونقص العبوات لم يُحذف من السبب', /ولم يظهر منها إلا 1/.test(pw.why), pw.why);
+check('والمخالفة الأصلية باقية أولاً', pw.why.indexOf('R248') < pw.why.indexOf('R247'), pw.why);
+pw = prepWhy([], ['R75: الفاتورة 500جم = 2 عبوة من 250جم ولم يظهر منها إلا 1'], []);
+check('بلا مخالفة أخرى تبقى 🔍 كما كانت', pw.st === 'needs_review', pw);
+check('صف بلا نقص ولا مخالفة يبقى مطابقاً بلا نص زائد',
+      prepWhy([], [], ['R80: عبوتان × 250جم = 500جم — مطابق للفاتورة وسماك']).st === 'matched');
+
 console.log('\n' + '='.repeat(60));
 if (failed) { console.log('سقطت ' + failed + ' حالة'); process.exit(1); }
 console.log('كل الاختبارات نجحت ✅');
