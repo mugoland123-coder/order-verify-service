@@ -133,6 +133,7 @@ def extract_first_json_object(text: str) -> str | None:
 class VerifyRequest(BaseModel):
     video_url: str
     invoice_text: str | None = None
+    blind_count: bool = False
 
 class FFmpegExtractionError(Exception):
     """يُرفع عند فشل ffmpeg تقنياً أثناء استخراج إطارات فيديو معيّن."""
@@ -219,6 +220,12 @@ def extract_frames_at(video_path: str, out_dir: str, timestamps):
     if not frames:
         raise FFmpegExtractionError("no frames extracted at the requested timestamps")
     return frames
+
+
+def _frame_index(path):
+    """رقم الإطار من اسم الملف frame_NNN.jpg — لنسب كل صورة إلى ثانيتها بلا تخمين."""
+    m = re.search(r"frame_(\d+)\.jpg$", str(path))
+    return int(m.group(1)) if m else None
 
 
 def extract_frames(video_path: str, out_dir: str, fps: float = 3.0):
@@ -564,6 +571,24 @@ def _self_check(order_code, platform, reference, ref_basis, products,
         "summary": "سليم" if not failed
                    else " | ".join((c["detail"] or c["id"]) for c in checks if not c["ok"]),
     }
+
+
+def _norm_sightings(raw):
+    """شهادة الملصقات لكل إطار كما سردها النموذج — دليل العدّ لا مصدره."""
+    out = []
+    for it in (raw or []):
+        if not isinstance(it, dict):
+            continue
+        pos = it.get("positions")
+        if not isinstance(pos, list):
+            pos = [pos] if pos else []
+        out.append({
+            "frame": _num(it.get("frame")),
+            "t": it.get("t"),
+            "code": str(it.get("code") or "").strip().upper() or None,
+            "positions": [str(p).strip() for p in pos if str(p or "").strip()],
+        })
+    return out
 
 
 def _norm_prepared_items(raw):
@@ -957,6 +982,7 @@ def normalize_result(parsed):
         "invoice_items": invoice_items,
         "invoice_sum_check": invoice_sum_check,
         "prepared_items": prepared_items,
+        "label_sightings": _norm_sightings(parsed.get("label_sightings")),
         "fulfillment": fulfillment,
         "order_source_hint": parsed.get("order_source_hint") or "not_applicable",
         "confidence": _norm_conf(parsed.get("confidence")),
@@ -967,7 +993,28 @@ def normalize_result(parsed):
     }
 
 
-def analyze_with_claude(image_content_blocks: list[dict], invoice_text: str | None) -> dict:
+_COUNT_PROTOCOL = (
+    "\n\n═════ بروتوكول عدّ العبوات (يُطبّق حرفياً) ═════\n"
+    "كل إطار مسبوق بسطر «إطار i — الثانية t». اعمل بهذه الخطوات بالترتيب:\n"
+    "1) لكل إطار على حدة: اسرد كل ملصق ظاهر فيه مع موضعه في الصورة "
+    "(أعلى / أسفل / يمين / يسار / وسط، ويجوز الجمع مثل «أعلى يمين»). "
+    "ملصق مقروء جزئياً يُسرد أيضاً مع ذكر ما قرأته منه.\n"
+    "2) عدد العبوات لكل كود = أكبر عدد ملصقات منفصلة تحمل نفس الكود ظهرت "
+    "معاً في إطار واحد. لا تجمع عبر الإطارات: العبوة نفسها تظهر في عشرات الإطارات.\n"
+    "3) ملصقان متطابقان في موضعين مختلفين من نفس الإطار = عبوتان، "
+    "حتى لو تطابق كل شيء فيهما (الكود والاسم والوزن والباركود).\n"
+    "4) لا تخترع عبوة لم ترَ ملصقها. ليس لديك فاتورة ولا عدد متوقّع، "
+    "ولا يجوز أن تستنتج العدد من سطور الفاتورة المطبوعة في الفيديو.\n"
+    "5) أضف إلى المخرج حقلاً اسمه label_sightings: قائمة من "
+    "{\"frame\": رقم الإطار, \"t\": الثانية كما طُبعت, \"code\": \"R..\", "
+    "\"positions\": [\"أعلى يمين\", \"أسفل يسار\"]} — سجّل فيها فقط الإطارات "
+    "التي ظهر فيها أكثر من ملصق لنفس الكود، وإطاراً واحداً ممثّلاً لكل كود آخر.\n"
+    "6) seen_count في prepared_items يأخذ قيمته من الخطوة (2) حصراً.\n"
+)
+
+
+def analyze_with_claude(image_content_blocks: list[dict], invoice_text: str | None,
+                        blind_count: bool = False) -> dict:
     """
     دالة تحليل الاستجابة المشتركة بين مسار الفيديو ومسار الصورة الثابتة:
     تستقبل قائمة كتل صور (إطارات فيديو مستخرجة عبر ffmpeg، أو صورة ثابتة
@@ -1091,7 +1138,10 @@ def analyze_with_claude(image_content_blocks: list[dict], invoice_text: str | No
         '"field_confidence": {"order_code": "high|medium|low", "platform": "high|medium|low", '
         '"branch": "high|medium|low", "order_total": "high|medium|low"}}'
     )
-    if invoice_text:
+    if blind_count:
+        prompt += _COUNT_PROTOCOL
+
+    if invoice_text and not blind_count:
         prompt += (
             "\n\nنص فاتورة مرجعية للمقارنة. استخدمه للتحقق من invoice_items فقط. "
             "يُمنع منعاً قاطعاً استخدامه في بناء prepared_items أو في الحكم على fulfillment — "
@@ -1149,7 +1199,8 @@ def verify_order(req: VerifyRequest):
                     "type": "image",
                     "source": {"type": "base64", "media_type": image_media_type, "data": img_b64}
                 }]
-                return analyze_with_claude(image_content, req.invoice_text)
+                return analyze_with_claude(image_content, req.invoice_text,
+                                            blind_count=req.blind_count)
             except ClaudeReadError as exc:
                 return _read_failed_response(exc)
             except Exception:
@@ -1162,11 +1213,10 @@ def verify_order(req: VerifyRequest):
         # المسار الحالي لمعالجة الفيديو — بدون أي تغيير في المنطق (ffmpeg
         # يستخرج الإطارات، ثم Claude API يحللها بنفس البرومبت الحالي).
         duration = probe_duration(input_path)
+        stamps = frame_timestamps(duration, 40) if duration else []
         try:
             if duration:
-                selected_frames = extract_frames_at(
-                    input_path, tmp, frame_timestamps(duration, 40)
-                )
+                selected_frames = extract_frames_at(input_path, tmp, stamps)
             else:
                 selected_frames = select_frames_covering_full_video(
                     extract_frames(input_path, tmp), max_frames=40
@@ -1182,6 +1232,14 @@ def verify_order(req: VerifyRequest):
 
         content = []
         for fp in selected_frames:
+            if req.blind_count:
+                # ترقيم صريح لكل إطار مع ثانيته، حتى يستطيع النموذج أن ينسب كل ملصق
+                # إلى إطاره وحده فلا يجمع نفس العبوة عبر عشرات الإطارات.
+                idx = _frame_index(fp)
+                t = stamps[idx] if (idx is not None and idx < len(stamps)) else None
+                label = ("إطار %d — الثانية %s" % (idx + 1, ("%.3f" % t) if t is not None else "?")) \
+                    if idx is not None else "إطار"
+                content.append({"type": "text", "text": label})
             img_b64 = base64.b64encode(fp.read_bytes()).decode()
             content.append({
                 "type": "image",
@@ -1189,7 +1247,8 @@ def verify_order(req: VerifyRequest):
             })
 
         try:
-            return analyze_with_claude(content, req.invoice_text)
+            return analyze_with_claude(content, req.invoice_text,
+                                       blind_count=req.blind_count)
         except ClaudeReadError as exc:
             return _read_failed_response(exc)
 
