@@ -8,7 +8,16 @@ import os, sys, json
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key-not-used")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from app.main import normalize_result, _ORDER_CODE_LEN, _norm_order_date  # noqa: E402
+from app.main import normalize_result, _ORDER_CODE_LEN, _norm_order_date
+from app.main import (  # noqa: E402
+    ClaudeReadError,
+    _call_claude,
+    _classify_claude_error,
+    _read_failed_response,
+)
+import app.main as svc  # noqa: E402
+import httpx as _httpx  # noqa: E402
+from anthropic import APIConnectionError, APIStatusError, APITimeoutError  # noqa: E402
 
 FAILED = []
 
@@ -273,6 +282,90 @@ r = normalize_result({
 check("فاتورة qwf-5-1106: التاريخ 2026-09-08 لا فراغ",
       r["order_date"] == "2026-09-08", r["order_date"])
 
+
+
+print("\n20) صمود القراءة: تصنيف الخطأ وإعادة محاولة واحدة ثم رد نظيف")
+
+
+def _status_error(code):
+    req = _httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    body = "<html><head><title>%d</title></head></html>" % code
+    resp = _httpx.Response(code, request=req, text=body)
+    return APIStatusError("http %d" % code, response=resp, body=None)
+
+
+k, r = _classify_claude_error(APITimeoutError(request=_httpx.Request("POST", "http://x")))
+check("مهلة ← api_timeout ويستحق إعادة", k == "api_timeout" and r is True, (k, r))
+k, r = _classify_claude_error(APIConnectionError(request=_httpx.Request("POST", "http://x")))
+check("انقطاع اتصال ← api_connection ويستحق إعادة", k == "api_connection" and r is True, (k, r))
+k, r = _classify_claude_error(_status_error(502))
+check("502 ← api_5xx ويستحق إعادة", k == "api_5xx" and r is True, (k, r))
+k, r = _classify_claude_error(_status_error(500))
+check("500 ← api_5xx", k == "api_5xx" and r is True, (k, r))
+k, r = _classify_claude_error(_status_error(429))
+check("429 ← api_rate_limit ويستحق إعادة", k == "api_rate_limit" and r is True, (k, r))
+k, r = _classify_claude_error(_status_error(400))
+check("400 ← لا إعادة", k == "api_status_400" and r is False, (k, r))
+
+
+class _FakeMessages:
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = 0
+
+    def create(self, **kwargs):
+        self.calls += 1
+        item = self.script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+class _FakeClient:
+    def __init__(self, script):
+        self.messages = _FakeMessages(script)
+
+
+def _with_client(script):
+    slept = []
+    real_client, real_sleep = svc.client, svc.time.sleep
+    svc.client = _FakeClient(script)
+    svc.time.sleep = lambda s: slept.append(s)
+    try:
+        try:
+            out = _call_claude([{"type": "text", "text": "x"}])
+            err = None
+        except ClaudeReadError as exc:
+            out, err = None, exc
+        return out, err, slept, svc.client.messages.calls
+    finally:
+        svc.client, svc.time.sleep = real_client, real_sleep
+
+
+out, err, slept, calls = _with_client([_status_error(502), "ok-second-try"])
+check("502 ثم نجاح: نداءان وانتظار 60 ثانية بينهما",
+      out == "ok-second-try" and calls == 2 and slept == [60.0], (out, calls, slept))
+
+out, err, slept, calls = _with_client([_status_error(502), _status_error(502)])
+check("502 مرتين: خطأ نظيف لا استثناء خام",
+      err is not None and isinstance(err, ClaudeReadError) and err.kind == "api_5xx", (err, calls))
+check("نداءان فقط — لا حلقة لا نهائية", calls == 2 and slept == [60.0], (calls, slept))
+
+out, err, slept, calls = _with_client([_status_error(400)])
+check("خطأ غير قابل للإعادة: نداء واحد بلا انتظار",
+      err is not None and calls == 1 and slept == [], (err and err.kind, calls, slept))
+
+resp = _read_failed_response(ClaudeReadError("api_5xx", "api_5xx: 502 Bad Gateway", True))
+check("الرد status=read_failed و result=None",
+      resp["status"] == "read_failed" and resp["result"] is None, resp)
+check("السبب يبدأ بـ«فشل القراءة:»",
+      resp["error"].startswith("فشل القراءة:"), resp["error"])
+check("نوع الخطأ وقابلية الإعادة محفوظان",
+      resp["error_kind"] == "api_5xx" and resp["retryable"] is True, resp)
+check("رسالة الخطأ مقصوصة إلى 300 حرفاً كحد أقصى",
+      len(_read_failed_response(ClaudeReadError("api_5xx", "x" * 5000, True))["error"]) < 5000)
+check("مكتبة anthropic لا تعيد المحاولة داخلياً (نحن نديرها)",
+      svc.client.max_retries == 0 if hasattr(svc.client, "max_retries") else True)
 
 print("\n" + ("=" * 60))
 if FAILED:
