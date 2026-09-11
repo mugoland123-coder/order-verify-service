@@ -173,6 +173,127 @@ r = adoptWithLegacy({ sheetDate: '2026-08-27', inv: 'qws-5-5260', printedDate: '
 check('صف له فاتورة يحتفظ بتاريخه بمصدر «من فاتورة سماك»',
   r.date === '2026-08-27' && r.dsrc === DSRC_INV, r);
 
+
+// ===== 4) صمود الدفعة: ملف واحد لا يُسقط الباقي، والقراءة المحفوظة لا تُشترى مرتين =====
+const MAX_TRIES_R = 3;
+const CONNISH = /connection|econnreset|etimedout|timeout|socket|abort|502|503|504|bad gateway|internalservererror|api_5xx|api_timeout|api_connection|offline/i;
+
+// قرار «فحص السجل» بعد التعديل
+function decide(file, logEntry, seenMd5, seenKey) {
+  const e = logEntry || null;
+  let parsed = null;
+  if (e && e.raw) {
+    try { const q = JSON.parse(e.raw); parsed = (q && q.result !== undefined) ? q.result : q; } catch (x) { parsed = null; }
+    if (parsed && (parsed.read_failed || parsed.skip)) parsed = null;
+  }
+  const st = (e && e.state) || {};
+  const crashes = Number(st.crashes || 0) || 0;
+  const md5 = String(file.md5 || '');
+  const size = String(file.size || '');
+  let dup = null;
+  if (!parsed) {
+    if (md5 && seenMd5[md5] && seenMd5[md5].id !== file.id) dup = seenMd5[md5];
+    if (!dup && size) { const k = String(file.name || '') + '|' + size; if (seenKey[k] && seenKey[k].id !== file.id) dup = seenKey[k]; }
+  }
+  if (dup) return { cached: true, result: null, skip: 'duplicate', dup_of: dup.name, attempts: 0 };
+  if (crashes >= 2 && !parsed) return { cached: true, result: null, skip: 'crash', attempts: (e.tries || 0) };
+  if (!e) return { cached: false, attempts: 1 };
+  if (e.redo) return { cached: false, attempts: 1 };
+  if (!parsed) return { cached: false, attempts: (e.tries || 0) + 1 };
+  return { cached: true, result: parsed, attempts: (e.tries || 1) };
+}
+
+// معالجة نتيجة الخدمة في «Parse Video Result» بعد التعديل
+function parseResult(dec, svc, prevState) {
+  const st = prevState || {};
+  const skip = String(dec.skip || '');
+  const status = String((svc && svc.status) || '');
+  const err = String((svc && svc.error) || '');
+  const kind = String((svc && svc.error_kind) || '');
+  if (skip === 'duplicate' || skip === 'crash' || status === 'read_failed' || (!status && err)) {
+    const prev = Number(st.crashes || 0) || 0;
+    let note = '', crashes = prev, att = Number(dec.attempts || 0) || 0;
+    if (skip === 'duplicate') { note = 'نسخة مكررة من ' + String(dec.dup_of || ''); att = 0; }
+    else if (skip === 'crash') { note = 'الملف يُسقط الخدمة'; }
+    else {
+      const msg = err || 'خطأ غير معروف';
+      note = 'فشل القراءة: ' + msg;
+      if (CONNISH.test(msg) || CONNISH.test(kind)) { crashes = prev + 1; att = Math.max(0, (Number(dec.attempts || 1) || 1) - 1); }
+    }
+    return { no_row: true, note: note, attempts: att, state: { crashes: crashes, note: note }, raw_json: JSON.stringify({ read_failed: true, skip: skip || 'read_failed', note: note }) };
+  }
+  return { no_row: false, attempts: dec.attempts, state: { crashes: 0, note: '' }, raw_json: JSON.stringify({ result: (svc && svc.result) || {} }) };
+}
+
+const OK_RAW = JSON.stringify({ result: { platform: 'keeta', order_code: null, order_total: 38 } });
+
+console.log('\n15) ملف واحد يفشل لا يُسقط الدفعة: سبب مكتوب وانتقال للملف التالي');
+let d = decide({ id: 'f1', name: 'a.mp4', size: '100' }, null, {}, {});
+let pr = parseResult(d, { status: 'read_failed', error: 'فشل القراءة: api_5xx: 502 Bad Gateway', error_kind: 'api_5xx' }, {});
+check('لا صف لهذا الملف', pr.no_row === true, pr);
+check('السبب يذكر «فشل القراءة»', /فشل القراءة/.test(pr.note), pr.note);
+check('لا يُخزَّن كنتيجة قابلة للاستخدام', JSON.parse(pr.raw_json).read_failed === true, pr.raw_json);
+d = decide({ id: 'f2', name: 'b.mp4', size: '200' }, null, {}, {});
+pr = parseResult(d, { status: 'ok', result: { platform: 'keeta', order_total: 38 } }, {});
+check('الملف التالي يُعالج ويُكتب له صف', pr.no_row === false && d.cached === false, [d, pr]);
+
+console.log('\n16) أخطاء الاتصال لا تُحسب محاولة، وأخطاء أخرى تُحسب');
+d = decide({ id: 'f1', name: 'a.mp4' }, { raw: '', tries: 1, redo: false, state: {} }, {}, {});
+check('المحاولات ترتفع إلى 2 قبل المعالجة', d.attempts === 2, d);
+pr = parseResult(d, { status: 'read_failed', error: 'connection aborted', error_kind: 'api_connection' }, { crashes: 0 });
+check('خطأ اتصال ← المحاولات تعود إلى 1', pr.attempts === 1, pr);
+check('عدّاد إسقاط الخدمة يرتفع إلى 1', pr.state.crashes === 1, pr.state);
+pr = parseResult(d, { status: 'read_failed', error: 'api_status_400: bad request', error_kind: 'api_status_400' }, { crashes: 0 });
+check('خطأ غير اتصالي ← المحاولات تبقى 2', pr.attempts === 2, pr);
+check('ولا يرفع عدّاد الإسقاط', pr.state.crashes === 0, pr.state);
+pr = parseResult({ attempts: 0 }, { status: 'read_failed', error: 'timeout', error_kind: 'api_timeout' }, { crashes: 0 });
+check('المحاولات لا تنزل تحت صفر', pr.attempts === 0, pr);
+
+console.log('\n17) ملف أسقط الخدمة في تشغيلين ← مراجعة يدوية بسبب «الملف يُسقط الخدمة»');
+d = decide({ id: 'f1', name: 'a.mp4' }, { raw: '', tries: 1, redo: false, state: { crashes: 2 } }, {}, {});
+check('لا يُرسل للخدمة', d.cached === true && d.skip === 'crash', d);
+pr = parseResult(d, null, { crashes: 2 });
+check('السبب «الملف يُسقط الخدمة»', pr.note === 'الملف يُسقط الخدمة', pr.note);
+check('ولا صف له', pr.no_row === true, pr);
+function closes(entry) {
+  const tries = Number(entry.tries || 0) || 0;
+  const st = entry.state || {};
+  if (tries >= MAX_TRIES_R && !entry.redo && !entry.matched) return true;
+  if ((Number(st.crashes || 0) || 0) >= 2 && !entry.redo) return true;
+  return false;
+}
+check('يُنقل للمراجعة اليدوية', closes({ tries: 1, redo: false, matched: false, state: { crashes: 2 } }) === true);
+check('إسقاط واحد لا يكفي', closes({ tries: 1, redo: false, matched: false, state: { crashes: 1 } }) === false);
+check('«أعد المعالجة» يمنع النقل', closes({ tries: 1, redo: true, matched: false, state: { crashes: 5 } }) === false);
+
+console.log('\n18) لا شراء قراءة مرتين: المحفوظة تُستخدم دائماً');
+const savedOk = { raw: OK_RAW, tries: 1, redo: false, state: { md5: 'M1', size: '100' } };
+d = decide({ id: 'f1', name: 'a.mp4', md5: 'M1', size: '100' }, savedOk, {}, {});
+check('قراءة ناجحة محفوظة ← لا استدعاء API', d.cached === true && d.result, d);
+check('حتى لو لم يُكتب لها صف في الشيت', d.cached === true, d);
+check('وحتى لو order_code فارغ', d.result.order_code === null && d.cached === true, d);
+d = decide({ id: 'f1', name: 'a.mp4', md5: 'M1', size: '100' }, Object.assign({}, savedOk, { redo: true }), {}, {});
+check('«أعد المعالجة» وحده يفرض إعادة القراءة', d.cached === false && d.attempts === 1, d);
+d = decide({ id: 'f1', name: 'a.mp4' }, { raw: JSON.stringify({ read_failed: true, note: 'فشل القراءة: x' }), tries: 1, redo: false, state: {} }, {}, {});
+check('سجل «فشل القراءة» ليس ذاكرة صالحة ← يُعاد', d.cached === false, d);
+
+console.log('\n19) النسخ المكررة: لا API ولا صف جديد');
+const seenMd5 = { M1: { id: 'old1', name: 'VID_20260910_023329.mp4' } };
+const seenKey = { 'VID_20260910_012456.mp4|17300000': { id: 'old3', name: 'VID_20260910_012456.mp4' } };
+d = decide({ id: 'new1', name: 'VID_20260910_023329.mp4', md5: 'M1', size: '68700000' }, null, seenMd5, seenKey);
+check('تطابق md5 ← نسخة مكررة', d.skip === 'duplicate' && d.dup_of === 'VID_20260910_023329.mp4', d);
+check('لا استدعاء API', d.cached === true && d.result === null, d);
+pr = parseResult(d, null, {});
+check('السبب «نسخة مكررة من …»', pr.note === 'نسخة مكررة من VID_20260910_023329.mp4', pr.note);
+check('ولا صف جديد', pr.no_row === true, pr);
+check('ولا محاولة محسوبة', pr.attempts === 0, pr);
+d = decide({ id: 'new3', name: 'VID_20260910_012456.mp4', md5: '', size: '17300000' }, null, seenMd5, seenKey);
+check('بلا md5: الاسم + الحجم يكفيان', d.skip === 'duplicate' && d.dup_of === 'VID_20260910_012456.mp4', d);
+d = decide({ id: 'new4', name: 'other.mp4', md5: 'ZZ', size: '999' }, null, seenMd5, seenKey);
+check('ملف مختلف لا يُعدّ مكرراً', !d.skip && d.cached === false, d);
+d = decide({ id: 'old1', name: 'VID_20260910_023329.mp4', md5: 'M1', size: '68700000' }, savedOk, seenMd5, seenKey);
+check('الملف لا يُعدّ نسخة من نفسه', !d.skip && d.cached === true, d);
+
 console.log('\n' + '='.repeat(60));
 if (failed) { console.log('سقطت ' + failed + ' حالة'); process.exit(1); }
 console.log('كل الاختبارات نجحت ✅');
