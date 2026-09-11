@@ -442,6 +442,159 @@ check('ولا تصبح ✅ أبداً',
   prepToStatus(judgePrep([{ r_code: 'R9', seen_count: 1, weight_g: 250 }],
             [{ r_code: 'R9', quantity: 0.75, weight_g: 750 }], 'full').st) === '🔍');
 
+// ===== 6) الفحص الثاني المركّز: أعمى، كود واحد، ولا يُشترى مرتين (منسوخ من العقد) =====
+function makeRecheck(tabRows){
+  const tab = tabRows;
+// ━━━━━ (3) الفحص الثاني المركّز: كود واحد في صف 🔍 ⇒ سؤال أعمى واحد، مرة واحدة ━━━━━
+// المصدر هو صفوف الطلبات نفسها كما كُتبت في التشغيل السابق، فلا حالة جديدة في الشيت:
+// أي صف 🔍 سببه نقص عدد عبوات لكود R يستحق سؤالاً واحداً مركّزاً عن ذلك الكود وحده.
+const RCK=/(R\d+)\s*:\s*الفاتورة\s*[\d.]+\s*جم\s*=\s*\d+\s*عبوة من\s*[\d.]+\s*جم ولم يظهر منها إلا\s*\d+/g;
+const PEND={};
+tab.slice(1).forEach(function(r){
+ const row=r||[];
+ if(String(row[0]||'').indexOf('🔍')<0) return;
+ const mm=String(row[1]||'').match(/[-\w]{25,}/);
+ if(!mm) return;
+ const txt=row.join(' ');
+ const codes=[]; let m; RCK.lastIndex=0;
+ while((m=RCK.exec(txt))) if(codes.indexOf(m[1])<0) codes.push(m[1]);
+ if(codes.length) PEND[mm[0]]=codes;
+});
+// كل كود يُسأل مرة واحدة في عمر الملف: العلامة المخزّنة في عمود «حالة الملف» تمنع
+// شراء القراءة مرة ثانية، ولا يُعاد السؤال إلا عند «أعد المعالجة» الذي يمسح كل شيء.
+function pickRecheck(fid,st,parsed){
+ const codes=PEND[fid]||[];
+ if(!codes.length) return null;
+ const done=(st&&st.recheck)||{};
+ for(let i=0;i<codes.length;i++){
+  const code=codes[i];
+  const mark=String(done[code]||'');
+  if(mark.indexOf('done')===0) continue;
+  const frames=[];
+  ((parsed&&parsed.label_sightings)||[]).forEach(function(s){
+   if(String((s&&s.code)||'').toUpperCase()!==code.toUpperCase()) return;
+   const f=Number(s.frame); if(f>0&&frames.indexOf(f)<0) frames.push(f);
+  });
+  return { code:code, frames:frames.sort(function(a,b){return a-b;}), prev:mark };
+ }
+ return null;
+}
+
+  return pickRecheck;
+}
+
+// نفس منطق «Parse Video Result» عند وصول رد count_only، معزولاً للاختبار
+function applyRecheck(cj, cjs, svc, resultJson){
+  const item = { json: { status: svc, result: resultJson } };
+  const _cjs = cjs || {};
+  const _svc = svc;
+ // ━━━━━ رد الفحص الثاني المركّز: يُرقَّع العدد داخل القراءة المحفوظة، ولا يُشترى مرتين ━━━━━
+ let _rcExtra={};
+ if(cj.recheck_code){
+  const _code=String(cj.recheck_code);
+  const _keep=cj.keep_result?JSON.parse(JSON.stringify(cj.keep_result)):null;
+  const _rk=Object.assign({},_cjs.recheck||{});
+  const _cr=(_svc==='count_only'&&item.json&&item.json.result)?item.json.result:null;
+  if(_cr&&_keep){
+   const _n=(_cr.count===null||_cr.count===undefined)?null:Number(_cr.count);
+   const _cf=String(_cr.confidence||'low');
+   if(_n!==null&&_n>0&&(_cf==='high'||_cf==='medium')){
+    _rk[_code]='done:'+_n;
+    _rcExtra={ recheck:_rk, note:'فحص مركّز '+_code+': '+_n+' عبوة (ثقة '+_cf+')' };
+    if(!Array.isArray(_keep.prepared_items)) _keep.prepared_items=[];
+    let _hit=false;
+    _keep.prepared_items.forEach(function(p){
+     if(String((p&&p.code)||'').toUpperCase()===_code.toUpperCase()){ p.seen_count=_n; _hit=true; }
+    });
+    if(!_hit) _keep.prepared_items.push({ code:_code, name:'', seen_count:_n, label_weight:null });
+   } else {
+    // لم يحسم: الصف يبقى 🔍 كما هو، والعلامة تمنع إعادة الشراء بلا نهاية.
+    _rk[_code]='done:unclear';
+    _rcExtra={ recheck:_rk, note:'فحص مركّز '+_code+': لم يحسم — '+String(_cr.note||'العدّ غير واضح') };
+   }
+   item.json=Object.assign({},item.json,{ status:'ok', cached:true, result:_keep });
+  } else if(_keep){
+   // فشل استدعاء الفحص المركّز: القراءة المحفوظة لا تُمسّ ولا يُكتب «فشل القراءة»،
+   // ومحاولة ثانية واحدة فقط ثم يُغلق الكود حتى لا يُشترى كل ساعة.
+   const _prev=String((_cjs.recheck||{})[_code]||'');
+   _rk[_code]=(_prev.indexOf('fail')===0)?'done:failed':'fail:1';
+   _rcExtra={ recheck:_rk, note:'فحص مركّز '+_code+': تعذّر الاستدعاء' };
+   item.json=Object.assign({},item.json,{ status:'ok', cached:true, result:_keep });
+  }
+ }
+
+  return { state: _rcExtra, item: item.json };
+}
+
+const TAB = [
+  ['الحالة','الفيديو','رقم الطلب'],
+  ['🔍 يحتاج مراجعتي',
+   '=HYPERLINK("https://drive.google.com/file/d/FILEAAAAAAAAAAAAAAAAAAAAAAAA/view","v.mp4")',
+   'qwd-5-1318','2026-09-10','keeta','كيتا','Al Khaleej','Al Khaleej','','','',114.48,114.48,'أجل',
+   'التحضير — R75: الفاتورة 500جم = 2 عبوة من 250جم ولم يظهر منها إلا 1'],
+  ['✅ مطابق',
+   '=HYPERLINK("https://drive.google.com/file/d/FILEBBBBBBBBBBBBBBBBBBBBBBBB/view","w.mp4")',
+   'qwd-5-1320','2026-09-10','keeta','كيتا','Al Khaleej','Al Khaleej','','','',50,50,'أجل',
+   'التحضير — R80: عبوتان × 250جم = 500جم — مطابق للفاتورة وسماك'],
+  ['⚠️ فيه فرق',
+   '=HYPERLINK("https://drive.google.com/file/d/FILECCCCCCCCCCCCCCCCCCCCCCCC/view","x.mp4")',
+   'qwd-5-1315','2026-09-10','keeta','كيتا','Al Khaleej','Al Khaleej','','','',40,40,'أجل',
+   'R373: المبلغ مطابق لكن عدد القطع 4 بسماك مقابل 1 بالفيديو'],
+];
+const pickRecheck = makeRecheck(TAB);
+const READ = { prepared_items:[{code:'R75',name:'متاي حار',seen_count:1,label_weight:'250g'}],
+               label_sightings:[{frame:7,t:3.2,code:'R75',positions:['أعلى يمين']},
+                                {frame:8,t:3.6,code:'R75',positions:['أعلى يمين','أسفل']},
+                                {frame:12,t:5.1,code:'R80',positions:['وسط']}] };
+
+console.log('\n23) الكود المعلّق يُنتزع من سبب الصف 🔍 وحده');
+let rc = pickRecheck('FILEAAAAAAAAAAAAAAAAAAAAAAAA', {}, READ);
+check('الكود R75', rc && rc.code === 'R75', rc);
+check('اللقطات هي لقطات هذا الكود فقط', JSON.stringify(rc.frames) === '[7,8]', rc);
+check('صف ✅ لا يُسأل عنه أبداً', pickRecheck('FILEBBBBBBBBBBBBBBBBBBBBBBBB', {}, READ) === null);
+check('صف ⚠️ بفرق عدد قطع لا يُسأل عنه (ليس نقص عبوات)',
+      pickRecheck('FILECCCCCCCCCCCCCCCCCCCCCCCC', {}, READ) === null);
+check('ملف لا صف له لا يُسأل عنه', pickRecheck('FILEZZZ', {}, READ) === null);
+check('كود مسؤول عنه سابقاً لا يُشترى مرة ثانية',
+      pickRecheck('FILEAAAAAAAAAAAAAAAAAAAAAAAA', {recheck:{R75:'done:2'}}, READ) === null);
+check('ولا حتى إذا كان الجواب السابق غير حاسم',
+      pickRecheck('FILEAAAAAAAAAAAAAAAAAAAAAAAA', {recheck:{R75:'done:unclear'}}, READ) === null);
+check('محاولة فاشلة واحدة تُعاد مرة ثانية فقط',
+      (pickRecheck('FILEAAAAAAAAAAAAAAAAAAAAAAAA', {recheck:{R75:'fail:1'}}, READ) || {}).code === 'R75');
+
+console.log('\n24) الرد الواضح يُرقّع العدد في القراءة المحفوظة، وغير الواضح يُبقي الصف 🔍');
+let ap = applyRecheck({recheck_code:'R75', keep_result:READ}, {crashes:0}, 'count_only',
+                      {code:'R75', count:2, confidence:'high', per_frame:[], note:null});
+check('seen_count صار 2', ap.item.result.prepared_items[0].seen_count === 2, ap.item.result.prepared_items);
+check('العلامة تمنع الشراء ثانية', ap.state.recheck.R75 === 'done:2', ap.state);
+check('السبب يذكر العدد والثقة', /فحص مركّز R75: 2 عبوة \(ثقة high\)/.test(ap.state.note), ap.state.note);
+check('القراءة المحفوظة الأصلية لم تُمسّ (نسخة لا مرجع)', READ.prepared_items[0].seen_count === 1);
+check('الرد يُعاد كقراءة سليمة لا كفشل', ap.item.status === 'ok' && ap.item.cached === true, ap.item.status);
+
+ap = applyRecheck({recheck_code:'R75', keep_result:READ}, {crashes:0}, 'count_only',
+                  {code:'R75', count:null, confidence:'low', per_frame:[], note:'الملصق محجوب'});
+check('عدد غير محسوم لا يُرقّع شيئاً', ap.item.result.prepared_items[0].seen_count === 1, ap.item.result.prepared_items);
+check('ويُعلَّم مغلقاً حتى لا يُشترى كل ساعة', ap.state.recheck.R75 === 'done:unclear', ap.state);
+check('والسبب يقول لم يحسم', /لم يحسم/.test(ap.state.note), ap.state.note);
+
+ap = applyRecheck({recheck_code:'R75', keep_result:READ}, {crashes:0}, 'count_only',
+                  {code:'R75', count:3, confidence:'low', per_frame:[], note:null});
+check('ثقة منخفضة لا تُرقّع ولو أعطت عدداً', ap.item.result.prepared_items[0].seen_count === 1, ap.item.result);
+
+ap = applyRecheck({recheck_code:'R75', keep_result:READ}, {crashes:1}, 'read_failed', null);
+check('فشل الفحص المركّز لا يمسح القراءة المحفوظة',
+      ap.item.result && ap.item.result.prepared_items[0].seen_count === 1, ap.item);
+check('ولا يُكتب «فشل القراءة» على الملف', ap.item.status === 'ok', ap.item.status);
+check('محاولة أولى تُعلَّم fail:1', ap.state.recheck.R75 === 'fail:1', ap.state);
+ap = applyRecheck({recheck_code:'R75', keep_result:READ}, {crashes:1, recheck:{R75:'fail:1'}}, 'read_failed', null);
+check('والثانية تُغلق الكود نهائياً', ap.state.recheck.R75 === 'done:failed', ap.state);
+
+ap = applyRecheck({recheck_code:'R99', keep_result:READ}, {crashes:0}, 'count_only',
+                  {code:'R99', count:2, confidence:'high', per_frame:[], note:null});
+check('كود لم يُرَ في القراءة يُضاف بندَ عبوات لا يُلقى',
+      ap.item.result.prepared_items.length === 2
+      && ap.item.result.prepared_items[1].seen_count === 2, ap.item.result.prepared_items);
+
 console.log('\n' + '='.repeat(60));
 if (failed) { console.log('سقطت ' + failed + ' حالة'); process.exit(1); }
 console.log('كل الاختبارات نجحت ✅');
