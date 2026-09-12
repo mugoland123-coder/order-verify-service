@@ -792,7 +792,7 @@ def _finalize_product(top, bottom, notes):
         qty = 1
         notes.append("كمية السطر العلوي غير مقروءة فاعتُبرت 1: «%s»" % _line_label(top))
     unit_top = top.get("price")
-    unit_bottom = bottom.get("price") if bottom else None
+    unit_bottom = bottom.get("price") if bottom else (0 if top.get("_desc_absorbed") else None)
     if unit_top is None and unit_bottom is None:
         unit_price = None
     else:
@@ -802,8 +802,8 @@ def _finalize_product(top, bottom, notes):
     src, src_kind = None, None
     if bottom is not None and bottom.get("weight_value") is not None:
         src, src_kind = bottom, "weight_line"
-    elif bottom is None and top.get("weight_value") is not None:
-        src, src_kind = top, "top_line"
+    elif top.get("weight_value") is not None:
+        src, src_kind = top, ("weight_line" if top.get("_weight_from_desc") else "top_line")
     unit_weight_g = _grams(src.get("weight_value"), src.get("weight_unit")) if src else None
     total_weight_g = None if unit_weight_g is None else round(unit_weight_g * qty, 2)
 
@@ -820,9 +820,41 @@ def _finalize_product(top, bottom, notes):
         "line_total": line_total,
         "unit_price_top": unit_top,
         "unit_price_weight_line": unit_bottom,
-        "merged_weight_line": bottom is not None,
+        "merged_weight_line": bool(bottom is not None or top.get("_desc_absorbed")),
         "weight_source": src_kind,
     }
+
+
+def _is_zero_desc(l):
+    """سطر وصف بسعر 0.00 بلا كود R: وصف حجم/وزن للمنتج الذي فوقه، لا منتج.
+    سطر بكود R خاص به ليس وصفاً ولو كان مجاناً — يبقى صنفاً مستقلاً."""
+    return _num(l.get("price")) == 0 and not l.get("code")
+
+
+def _fold_zero_desc(lines, notes):
+    """
+    قاعدة صاحبة النظام (2026-09-12): سطر بسعر 0.00 لا يُعدّ منتجاً أبداً.
+    يُؤخذ منه الوزن أو الحجم ويُنسب للسطر الذي فوقه، ثم يُطرح من السطور —
+    قبل أي تخطيط، فلا يصل سطر 0.00 بلا كود إلى بناء المنتجات في أي طلب وأي منصة.
+    سطر الوصف بسعر حقيقي لا يمسّه هذا الطيّ: يبقى على مساره القديم (يُجمع سعره مع ما فوقه).
+    """
+    out = []
+    for l in lines:
+        if not _is_zero_desc(l):
+            out.append(dict(l))
+            continue
+        if not out:
+            # لا سطر منتج قبله: لا يصير بنداً، ويُسجَّل السبب صريحاً
+            notes.append("سطر بسعر 0.00 بلا سطر منتج قبله فلم يُحتسب: «%s»" % _line_label(l))
+            continue
+        prev = out[-1]
+        prev["_desc_absorbed"] = True
+        if prev.get("weight_value") is None and l.get("weight_value") is not None:
+            prev["weight_value"] = l.get("weight_value")
+            prev["weight_unit"] = l.get("weight_unit")
+            prev["weight"] = l.get("weight")
+            prev["_weight_from_desc"] = True
+    return out
 
 
 def _assemble_products(lines, items_count):
@@ -833,6 +865,7 @@ def _assemble_products(lines, items_count):
     وإن لم يكن مقروءاً فلا دمج، ويُسجَّل السبب صريحاً (المبلغ لا يميّز الدمج في منتج 1X).
     """
     plan, notes, tent_notes = [], [], []
+    lines = _fold_zero_desc(lines, notes)
     i, n = 0, len(lines)
     while i < n:
         bottom_idx, tentative = None, False
