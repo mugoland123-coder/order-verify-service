@@ -781,6 +781,112 @@ check('العمودان الجديدان يُكتبان «—» فلا تبقى 
   P.values[1].length===7 && P.values[1][5]==='—' && P.values[1][6]==='—', P.values[1]);
 
 
+console.log('\n32) عدّاد المحاولات§ تعريف واحد في كل النظام (المصدر الواحد + تصنيف الأعطال + السقف)');
+// نُسخت حرفياً من «ثوابت النظام» ومن العقد المستهلكة بعد التوحيد.
+const SERVICE_FAULT_PATTERN = 'connection|econnreset|etimedout|socket hang up|socket|abort|network|offline|dns|502|503|504|429|bad gateway|gateway timeout|service unavailable|internalservererror|api_5xx|api_timeout|api_connection|credit balance|insufficient_quota|quota|rate_?limit|too many requests|overloaded|server_error';
+
+function makeCounter(MAX_TRIES) {
+  const SF = new RegExp(SERVICE_FAULT_PATTERN, 'i');
+  function isServiceFault() {
+    for (let i = 0; i < arguments.length; i++) { const s = String(arguments[i] || ''); if (s && SF.test(s)) return true; }
+    return false;
+  }
+  function clampTries(n) { n = Number(n) || 0; if (n < 0) n = 0; if (n > MAX_TRIES) n = MAX_TRIES; return n; }
+  // «فحص السجل»: يقرر الأساس وهل هذه محاولة تُحتسب — بلا أي زيادة هنا
+  function ladder(e, opts) {
+    const o = opts || {};
+    if (o.dup) return { attempts_base: 0, count_attempt: false, skip: 'duplicate' };
+    if (o.crash) return { attempts_base: (e && e.tries) || 0, count_attempt: false, skip: 'crash' };
+    if (!e) return { attempts_base: 0, count_attempt: true };
+    if (e.redo) return { attempts_base: 0, count_attempt: true };
+    if (!o.parsed) return { attempts_base: (e.tries || 0), count_attempt: true };
+    if (o.recheck) return { attempts_base: (e.tries || 1), count_attempt: false };
+    return { attempts_base: (e.tries || 1), count_attempt: false };
+  }
+  // «Parse Video Result»: موضع الزيادة الوحيد — القرار قبل الزيادة، ثم السقف
+  function finalAttempts(dec, outcome) {
+    const o = outcome || {};
+    if (dec.skip === 'duplicate') return 0;
+    const fault = (dec.skip === 'crash') ? false : isServiceFault(o.error, o.error_kind, o.raw_response);
+    return clampTries(Number(dec.attempts_base || 0) + ((dec.count_attempt && !fault) ? 1 : 0));
+  }
+  // «Filter Media Files» / «تحديد الملفات المقفلة»
+  function isClosed(tries, redo) { return (Number(tries) || 0) >= MAX_TRIES && !redo; }
+  // «Build Orders Table»
+  function noInvoiceWhy(tries) {
+    return ((Number(tries) || 0) >= MAX_TRIES) ? ('استُنفدت ' + MAX_TRIES + ' محاولات ولم تُوجد فاتورة سماك مقابلة') : null;
+  }
+  // «فحص ذاتي»
+  function selfCheck(rows) {
+    let bad = 0;
+    rows.forEach(function (r) { const n = Number(r); if (!(n >= 0 && n <= MAX_TRIES)) bad++; });
+    return bad ? (bad + ' صف بعدد محاولات خارج النطاق 0..' + MAX_TRIES) : '';
+  }
+  return { isServiceFault, clampTries, ladder, finalAttempts, isClosed, noInvoiceWhy, selfCheck, MAX_TRIES };
+}
+
+const C = makeCounter(3);
+
+// (أ) عطل خدمة/رصيد/اتصال ⇒ العدّاد لا يتغير إطلاقاً (لا زيادة ثم خصم)
+[['502 Bad Gateway', 'api_5xx'], ['ECONNRESET socket hang up', ''], ['Your credit balance is too low', ''],
+ ['429 too many requests', ''], ['overloaded_error', ''], ['insufficient_quota', '']].forEach(function (p) {
+  const dec = C.ladder({ tries: 1 }, { parsed: false });
+  const got = C.finalAttempts(dec, { error: p[0], error_kind: p[1] });
+  check('عطل خدمة «' + p[0].slice(0, 28) + '» ⇒ العدّاد يبقى 1', got === 1, got);
+});
+check('عطل خدمة على مسار النجاح (raw_response فيه rate limit) ⇒ ملف جديد يبقى 0',
+  C.finalAttempts(C.ladder(null, { parsed: false }), { raw_response: '429 rate limit exceeded' }) === 0);
+
+// (ب) خطأ حقيقي ⇒ +1 ولا يتجاوز MAX_TRIES في أي مسار
+check('خطأ حقيقي ⇒ 2 تصير 3',
+  C.finalAttempts(C.ladder({ tries: 2 }, { parsed: false }), { error: 'ValueError: could not parse frames' }) === 3);
+check('ملف جديد بقراءة ناجحة ⇒ 1',
+  C.finalAttempts(C.ladder(null, { parsed: false }), { raw_response: '' }) === 1);
+check('مسار closed بسجل ناقص§ أساس 3 + خطأ حقيقي ⇒ 3 لا 4 (السقف عند موضع الزيادة)',
+  C.finalAttempts(C.ladder({ tries: 3 }, { parsed: false }), { error: 'bad frames' }) === 3);
+check('قيمة تالفة في السجل (9) لا تخرج من النطاق بعد المرور',
+  C.finalAttempts(C.ladder({ tries: 9 }, { parsed: false }), { error: 'bad frames' }) === 3);
+check('لا يُعتمد على الاستبعاد الأعلى§ الملف المقفل يُستبعد أصلاً', C.isClosed(3, false) === true);
+check('علم «أعد المعالجة» يفتح المقفل ويُصفّر الأساس',
+  C.isClosed(3, true) === false && C.ladder({ tries: 3, redo: true }, { parsed: false }).attempts_base === 0);
+
+// (ج) العدّاد 0 ⇒ لا إنذار، و(د) النسخة المكررة عدّادها 0
+check('العدّاد 0 لا يُنتج إنذاراً', C.selfCheck([0, 1, 2, 3]) === '');
+check('العدّاد 4 يُنتج إنذاراً بالنطاق الصحيح', C.selfCheck([0, 4]) === '1 صف بعدد محاولات خارج النطاق 0..3');
+const dupDec = C.ladder({ tries: 2 }, { dup: true });
+check('نسخة مكررة ⇒ عدّادها 0', C.finalAttempts(dupDec, { error: '502' }) === 0 && dupDec.count_attempt === false);
+check('نسخة مكررة ⇒ صفر إنذار', C.selfCheck([C.finalAttempts(dupDec, {})]) === '');
+
+// (هـ) تغيير MAX_TRIES في المصدر الواحد ⇒ كل المواضع تتبعه
+[2, 5].forEach(function (M) {
+  const K = makeCounter(M);
+  check('MAX=' + M + '§ السقف يتبع',
+    K.finalAttempts(K.ladder({ tries: 99 }, { parsed: false }), { error: 'bad frames' }) === M);
+  check('MAX=' + M + '§ الإقفال يتبع',
+    K.isClosed(M, false) === true && K.isClosed(M - 1, false) === false);
+  check('MAX=' + M + '§ نص «بلا فاتورة» يتبع',
+    K.noInvoiceWhy(M) === ('استُنفدت ' + M + ' محاولات ولم تُوجد فاتورة سماك مقابلة') && K.noInvoiceWhy(M - 1) === null);
+  check('MAX=' + M + '§ نطاق الفحص الذاتي يتبع',
+    K.selfCheck([M]) === '' && K.selfCheck([M + 1]) === '1 صف بعدد محاولات خارج النطاق 0..' + M);
+});
+// حارس: أي موضع يُبقي الحد مكتوباً رقماً لن يتغير مع MAX — نكشفه بالمقارنة بين حدّين
+const A = makeCounter(2), B = makeCounter(5);
+check('كشف أي موضع لم يتبع المصدر الواحد',
+  A.clampTries(9) !== B.clampTries(9) && A.isClosed(3, false) !== B.isClosed(3, false) &&
+  A.selfCheck([3]) !== B.selfCheck([3]) && A.noInvoiceWhy(3) !== B.noInvoiceWhy(3));
+
+// (و) نص النسخة المكررة يذكر أساس المطابقة والمعرّفين
+function dupNote(basis, name, curId, origId) {
+  return 'نسخة مكررة (تطابق ' + String(basis || 'غير محدد') + ') من «' + String(name || '') + '» — المعرّف الحالي ' +
+    String(curId || '') + ' ؛ المعرّف الأصلي ' + (String(origId || '') || 'غير مسجّل');
+}
+const NT = dupNote('md5', 'TWIN.mp4', 'idA', 'idB');
+check('النص يذكر أساس المطابقة', NT.indexOf('تطابق md5') > 0, NT);
+check('النص يذكر المعرّفين ولا يكرر معرّفاً واحداً',
+  NT.indexOf('idA') > 0 && NT.indexOf('idB') > 0 && NT.indexOf('idA') !== NT.indexOf('idB'), NT);
+check('أساس «الاسم+الحجم» يظهر كما هو', dupNote('الاسم+الحجم', 'x.mp4', 'i1', 'i2').indexOf('تطابق الاسم+الحجم') > 0);
+check('معرّف أصلي غير مسجّل يُكتب صراحةً', dupNote('وسم محفوظ من تشغيل سابق', 'x.mp4', 'i1', '').indexOf('غير مسجّل') > 0);
+
 console.log('\n' + '='.repeat(60));
 if (failed) { console.log('سقطت ' + failed + ' حالة'); process.exit(1); }
 console.log('كل الاختبارات نجحت ✅');
