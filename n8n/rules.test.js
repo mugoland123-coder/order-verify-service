@@ -674,6 +674,113 @@ check('بلا مخالفة أخرى تبقى 🔍 كما كانت', pw.st === 'n
 check('صف بلا نقص ولا مخالفة يبقى مطابقاً بلا نص زائد',
       prepWhy([], [], ['R80: عبوتان × 250جم = 500جم — مطابق للفاتورة وسماك']).st === 'matched');
 
+
+console.log('\n29) قائمة سماك البيضاء — بالرمز أولاً، ثم الاسم، ثم مستبعدة/مجهولة');
+// منقولة حرفياً من «Split Invoices & Items (Samak)»
+const WHITE_CODES = { '3':['toyou','تويو'], '5':['hunger','هنجر'], '21':['jahez','جاهز'],
+                      '31':['marsool','مرسول'], '52':['thechefz','شيفز'], '342':['keeta','كيتا'],
+                      '355':['ninja','نينجا'] };
+const BLACK_CODES = { '19':'امازون', '7':'سلة', '379':'مضارب نجدية' };
+const BLACK_NAMES = ['الموردين المحليين'];
+function arNormT(s){ return String(s==null?'':s).replace(/[ً-ْـ]/g,'').replace(/[یى]/g,'ي')
+  .replace(/[ک]/g,'ك').replace(/[أإآ]/g,'ا').replace(/ة/g,'ه').replace(/\s+/g,''); }
+const PF_T = [['keeta','كيتا',['keeta','كيتا']],['jahez','جاهز',['jahez','جاهز']],
+ ['hunger','هنجر',['hunger','hungerstation','هنجر','هنقر','هنجرستيشن']],
+ ['ninja','نينجا',['ninja','نينجا','نينجه']],['thechefz','شيفز',['thechefz','chefz','شيفز','شيقز']],
+ ['marsool','مرسول',['marsool','مرسول']],['toyou','تويو',['toyou','تويو']]];
+function platInfoT(v){ const raw=String(v==null?'':v).trim(); if(!raw) return {code:'',ar:''};
+ const low=raw.toLowerCase(); const ar=arNormT(raw);
+ for(const p of PF_T) for(const a of p[2]){
+  if(/^[a-z]+$/.test(a)){ if(low.indexOf(a)>=0) return {code:p[0],ar:p[1]}; }
+  else { if(ar.indexOf(arNormT(a))>=0) return {code:p[0],ar:p[1]}; } }
+ return {code:'',ar:''}; }
+function normCustCode(v){ if(v===null||v===undefined) return '';
+ let s=String(v).replace(/\s+/g,'').trim(); if(!s) return '';
+ s=s.replace(/\.0+$/,''); if(!/^\d+$/.test(s)) return s; s=s.replace(/^0+(?=\d)/,''); return s; }
+function classifyCustomer(code,name,p){
+ if(code && Object.prototype.hasOwnProperty.call(WHITE_CODES,code))
+  return {state:'accepted',via:'code',platform:WHITE_CODES[code][0]};
+ if(p && p.code) return {state:'accepted',via:'name',platform:p.code};
+ if(code && Object.prototype.hasOwnProperty.call(BLACK_CODES,code))
+  return {state:'excluded',via:'code',why:BLACK_CODES[code]};
+ const arn=arNormT(name||'');
+ for(const bn of BLACK_NAMES){ const b=arNormT(bn); if(arn&&b&&arn.indexOf(b)>=0) return {state:'excluded',via:'name',why:bn}; }
+ return {state:'unknown',via:'',why:''}; }
+function CLS(code,name){ const r=classifyCustomer(normCustCode(code), name||'', platInfoT(name||''));
+ return r.state + (r.platform?(':'+r.platform):(r.why?(':'+r.why):'')); }
+
+check('رمز 3 = تويو ولا يطابق 31 ولا 342 ولا 355 ولا 379',
+  CLS('3','')==='accepted:toyou' && CLS('31','')==='accepted:marsool' &&
+  CLS('342','')==='accepted:keeta' && CLS('355','')==='accepted:ninja' &&
+  CLS('379','مضارب نجدية')==='excluded:مضارب نجدية');
+check('رمز 5 = هنجر ولا يطابق 52 ولا 355', CLS('5','')==='accepted:hunger' && CLS('52','')==='accepted:thechefz');
+check('رمز 7 = سلة مستبعدة ولا يطابق 21 ولا 31 ولا 52',
+  CLS('7','')==='excluded:سلة' && CLS('21','')==='accepted:jahez' && CLS('31','')==='accepted:marsool');
+check('«03» و«3.0» و« 3 » و«0003.00» كلها تويو',
+  ['03','3.0',' 3 ','0003.00'].every(c=>CLS(c,'')==='accepted:toyou'));
+check('الخانة الفارغة ليست صفراً', normCustCode('')==='' && normCustCode('0')==='0');
+check('لا احتواء: «35» و«3550» ليستا نينجا', CLS('35','')==='unknown' && CLS('3550','')==='unknown');
+check('«شركة كيتا» تُقبل بالرمز 342 وحده مع اسم فارغ', CLS('342','')==='accepted:keeta');
+check('اسم هنجر بالحروف الفارسية يُقبل بالاسم وحده بلا رمز',
+  CLS('','شرکه هنجرستیشن المحدوده-Hunger Station')==='accepted:hunger');
+check('بلا رمز واسم فيه مرسول ⇒ مقبولة', CLS('','مؤسسة مرسول للتوصيل')==='accepted:marsool');
+check('«الموردين المحليين» بلا رمز ⇒ مستبعدة', CLS('','الموردين المحليين')==='excluded:الموردين المحليين');
+check('رمز 19 امازون و7 سلة ⇒ مستبعدتان', CLS('19','Amazon')==='excluded:امازون' && CLS('7','سلة')==='excluded:سلة');
+check('رمز 99 واسم غير معروف ⇒ مجهولة لا مستبعدة', CLS('99','مورد غير معروف')==='unknown');
+check('الرمز يسبق الاسم عند التعارض', CLS('5','شركة كيتا')==='accepted:hunger');
+// تقرير يوم كامل حقيقي§ 83 فاتورة و8 عملاء
+const FIXTURE = [['شرکه هنجرستیشن المحدوده-Hunger Station','5',20,'accepted'],
+ ['شركة نينجا - Ninja','355',7,'accepted'],['شركة كيتا','342',7,'accepted'],
+ ['شركة جاهز -Jahez','21',6,'accepted'],['امازون ','19',22,'excluded'],
+ ['الموردين المحليين','',18,'excluded'],['شركة تطبيق سلة لتقنية المعلومات','7',2,'excluded'],
+ ['شركة مضارب نجدية التراثي شركة شخص واحد','379',1,'excluded']];
+let acc=0, exc=0, unk=0, totalFx=0;
+FIXTURE.forEach(function(c){ const st=CLS(c[1],c[0]).split(':')[0]; totalFx+=c[2];
+ if(st!==c[3]) unk+=c[2]; else if(st==='accepted') acc+=c[2]; else exc+=c[2]; });
+check('83 فاتورة ⇒ 40 مقبولة و43 مستبعدة و0 مجهولة',
+  totalFx===83 && acc===40 && exc===43 && unk===0, {totalFx:totalFx,acc:acc,exc:exc,unk:unk});
+
+console.log('\n30) مفتاح الفاتورة§ التطبيع والنسخة المطابقة والتعارض الحقيقي');
+function normInvNo(v){ return String(v==null?'':v).trim().toLowerCase().replace(/\s+/g,''); }
+check('صيغتان للرقم نفسه ⇒ مفتاح واحد', normInvNo('QWS-5-5468')===normInvNo(' qws-5-5468 '));
+check('الأصفار البادئة لا تُحذف', normInvNo('0005-10178')==='0005-10178' && normInvNo('0005-10178')!==normInvNo('5-10178'));
+const DIFF_FIELDS=[['المبلغ','amount'],['الفرع','branch'],['التاريخ','date']];
+function diffOf(a,b){ const out=[]; DIFF_FIELDS.forEach(function(f){ const x=a[f[1]],y=b[f[1]];
+ if(x===undefined||x===null||y===undefined||y===null) return;
+ if(String(x)!==String(y)) out.push({field:f[0],values:[x,y]}); }); return out; }
+check('نسخة مكررة مطابقة ليست تعارضاً',
+  diffOf({amount:50,branch:'المصيف',date:'2026-09-07'},{amount:50,branch:'المصيف',date:'2026-09-07'}).length===0);
+let dd = diffOf({amount:50,branch:'المصيف',date:'2026-09-07'},{amount:70,branch:'المصيف',date:'2026-09-07'});
+check('اختلاف المبلغ ⇒ تعارض حقيقي بالقيمتين',
+  dd.length===1 && dd[0].field==='المبلغ' && dd[0].values[0]===50 && dd[0].values[1]===70, dd);
+check('اختلاف الفرع ⇒ تعارض حقيقي',
+  diffOf({amount:50,branch:'المصيف'},{amount:50,branch:'الخليج'}).length===1);
+check('حقل غائب عن أحد الطرفين لا يُعدّ اختلافاً',
+  diffOf({amount:50},{amount:50,branch:'الخليج'}).length===0);
+
+console.log('\n31) سطر نبض النظام§ المدى يتبع الترويسة، وغير المتاح «—»');
+function pulseRow(header, raw){
+ const DASH='—';
+ const val=function(v){ const s=(v===null||v===undefined)?'':String(v); return s.trim()===''?DASH:s; };
+ const colLetter=function(n){ let s=''; while(n>0){ const r=(n-1)%26; s=String.fromCharCode(65+r)+s; n=Math.floor((n-1)/26); } return s; };
+ const row=[]; for(let i=0;i<header.length;i++) row.push(val(raw[i]));
+ return { range:'نبض النظام!A1:'+colLetter(header.length)+'2', values:[header,row] };
+}
+const H5=['آخر تشغيل ناجح (الرياض)','معرّف التشغيل','عدد الصفوف','نوع التشغيل','تقرير بوابة سماك'];
+let P = pulseRow(H5, ['2026-09-12 16:00:00','950',129,'production','مجهولة 0 | تعارضات 0']);
+check('المدى يغطي كل أعمدة الترويسة', P.range==='نبض النظام!A1:E2', P.range);
+check('طول الصف = طول الترويسة', P.values[1].length===H5.length);
+check('لا خلية فارغة في نطاق الترويسة', P.values[1].every(x=>String(x).trim()!==''));
+P = pulseRow(H5, ['2026-09-12 16:00:00', null, undefined, '', 'مجهولة 0 | تعارضات 0']);
+check('قيمة غير متاحة تُكتب «—» لا فراغاً',
+  P.values[1][1]==='—' && P.values[1][2]==='—' && P.values[1][3]==='—', P.values[1]);
+const H7 = H5.concat(['عمود سادس','عمود سابع']);
+P = pulseRow(H7, ['a','b','c','d','e']);
+check('إضافة عمودين ⇒ المدى يتسع تلقائياً بلا تعديل يدوي', P.range==='نبض النظام!A1:G2', P.range);
+check('العمودان الجديدان يُكتبان «—» فلا تبقى قيمة تشغيل أقدم',
+  P.values[1].length===7 && P.values[1][5]==='—' && P.values[1][6]==='—', P.values[1]);
+
+
 console.log('\n' + '='.repeat(60));
 if (failed) { console.log('سقطت ' + failed + ' حالة'); process.exit(1); }
 console.log('كل الاختبارات نجحت ✅');
