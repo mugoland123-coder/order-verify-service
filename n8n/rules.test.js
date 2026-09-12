@@ -926,8 +926,46 @@ const normInvNo33 = function (v) { return String(v == null ? '' : v).trim().toLo
 const fileIdOf33 = function (s) { const m = String(s || '').match(/[-\w]{25,}/); return m ? m[0] : ''; };
 const keyOf = function (link, inv) { const f = fileIdOf33(link); return f ? ('FILE:' + f) : ('INV:' + normInvNo33(inv)); };
 
-function buildToday(prevPrints, rows, keys, now, prevTodayRows, header) {
+// مفاتيح ترتيب «اليوم» — منسوخة حرفياً من «بناء اليوم والبصمات» (منشور مع ترتيب الفروع)
+const DEFAULT_BRANCH_ORDER = [
+  { name: 'المصيف',    aliases: ['المصيف', 'Al Masiaf', 'Al Masyaf', 'Masiaf', 'Masyaf', '1'] },
+  { name: 'الوشم',     aliases: ['الوشم', 'Al Wisham', 'Al Washm', 'Wisham', 'Washm', '2'] },
+  { name: 'الخليج',    aliases: ['الخليج', 'Al Khaleej', 'Al Khalij', 'Khaleej', 'Khalij', '3'] },
+  { name: 'الياسمين',  aliases: ['الياسمين', 'Al Yasmin', 'Al Yasameen', 'Yasmin', 'Yasameen', '4'] },
+  { name: 'ظهرة لبن',  aliases: ['ظهرة لبن', 'ظهره لبن', 'Dhahrat Laban', 'Dhahret Laban', 'Laban', '5'] }
+];
+const normBranch = function (v) {
+  let s = String(v == null ? '' : v).toLowerCase();
+  s = s.replace(/[\u064B-\u0652\u0640]/g, '');
+  s = s.replace(/[\u0623\u0625\u0622\u0671]/g, '\u0627').replace(/\u0649/g, '\u064A').replace(/\u0624/g, '\u0648').replace(/\u0626/g, '\u064A').replace(/\u0629/g, '\u0647');
+  s = s.replace(/[^0-9a-z\u0621-\u064A]/g, '');
+  s = s.replace(/^\u0627\u0644/, '').replace(/^al/, '');
+  return s;
+};
+const branchIndex = function (order) {
+  const names = [], map = {};
+  (order || []).forEach(function (b, i) {
+    const nm = (b && b.name) || String(b || ''); names.push(nm);
+    (((b && b.aliases) || []).concat([nm])).forEach(function (a) { const k = normBranch(a); if (k && map[k] === undefined) map[k] = i; });
+  });
+  return { names: names, map: map, unknown: names.length };
+};
+const branchRawOf = function (r) { const s = String(r[7] == null ? '' : r[7]).trim(); return s || String(r[6] == null ? '' : r[6]).trim(); };
+const dateKeyOf = function (v) {
+  const s = String(v == null ? '' : v).trim(); if (!s) return 0;
+  let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) return Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  m = s.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})$/);
+  if (m) return Date.UTC(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+  if (/^\d{5}$/.test(s)) return Date.UTC(1899, 11, 30) + Number(s) * 86400000;
+  const t = Date.parse(s); return isNaN(t) ? 0 : t;
+};
+const invKeyOf = function (v) { const s = String(v == null ? '' : v).trim().toLowerCase(); return s || '\uFFFF'; };
+
+function buildToday(prevPrints, rows, keys, now, prevTodayRows, header, order) {
   const TS = now, TODAY = String(now).slice(0, 10);
+  const BI = branchIndex(order || DEFAULT_BRANCH_ORDER);
+  const unkBranch = {}; let noBranchRows = 0;
   const prevMap = {};
   prevPrints.slice(1).forEach(function (r) { const k = normCell(r && r[0]); if (!k) return; prevMap[k] = { fp: String(r[1] || ''), at: String(r[2] || '') }; });
   const seen = {}, outPrints = [], todayRows = [];
@@ -945,11 +983,18 @@ function buildToday(prevPrints, rows, keys, now, prevTodayRows, header) {
     const at = changed ? TS : (old.at || TS);
     outPrints.push([k, fp, at]);
     // «اليوم» سجل تغييرات لا مرآة: يدخله الصف الجديد أو المتغيّر وحده
-    if (changed) todayRows.push({ r: r, at: at, st: String(r[0] || '') });
+    const brRaw = branchRawOf(r);
+    const bk = normBranch(brRaw);
+    const brIdx = (bk && BI.map[bk] !== undefined) ? BI.map[bk] : BI.unknown;
+    if (brIdx === BI.unknown) { if (brRaw) unkBranch[brRaw] = (unkBranch[brRaw] || 0) + 1; else noBranchRows++; }
+    if (changed) todayRows.push({ r: r, at: at, st: String(r[0] || ''), br: brIdx, dt: dateKeyOf(r[3]), inv: invKeyOf(r[2]) });
   });
   let kept = 0;
   Object.keys(prevMap).forEach(function (k) { if (seen[k]) return; kept++; outPrints.push([k, prevMap[k].fp, prevMap[k].at]); });
-  todayRows.sort(function (a, b) { return (rankOf(a.st) - rankOf(b.st)) || String(b.at).localeCompare(String(a.at)); });
+  // الفرع بترتيب الثوابت ⇒ التاريخ الأحدث أولاً ⇒ الحالة الأسوأ أولاً ⇒ رقم فاتورة سماك تصاعدياً
+  todayRows.sort(function (a, b) {
+    return (a.br - b.br) || (b.dt - a.dt) || (rankOf(a.st) - rankOf(b.st)) || (a.inv < b.inv ? -1 : (a.inv > b.inv ? 1 : 0));
+  });
   const todayValues = [header];
   if (todayRows.length) todayRows.forEach(function (x) { const rr = x.r.slice(); while (rr.length < TODAY_WIDTH) rr.push(''); todayValues.push(rr.slice(0, TODAY_WIDTH)); });
   else { const b = new Array(TODAY_WIDTH).fill(''); b[0] = 'لا تغييرات اليوم'; b[14] = 'آخر تحديث: ' + TS + ' (الرياض)'; todayValues.push(b); }
@@ -959,7 +1004,8 @@ function buildToday(prevPrints, rows, keys, now, prevTodayRows, header) {
   return { writeToday: guardOk, writePrints: guardOk,
     todayValues: guardOk ? todayValues : [], printValues: guardOk ? printValues : [],
     stats: { newKeys: nNew, changedKeys: nChanged, unchanged: nSame, todayCount: actualToday,
-      expectedToday: expectedToday, guardOk: guardOk, keptAbsent: kept, duplicateKeys: dup } };
+      expectedToday: expectedToday, guardOk: guardOk, keptAbsent: kept, duplicateKeys: dup,
+      branchOrder: BI.names, unknownBranches: unkBranch, noBranchRows: noBranchRows } };
 }
 
 const H17 = ['الحالة', 'رابط الفيديو', 'رقم فاتورة سماك', 'التاريخ', 'المنصة (من الفيديو)', 'المنصة (من سماك)',
@@ -1111,6 +1157,93 @@ check('بصمة قديمة مطابقة ⇒ unchanged لا changed', MIG.stats.u
 check('ولا تدخل «اليوم»', MIG.stats.todayCount === 0);
 check('وتُخزَّن بالصيغة الجديدة v2', String(MIG.printValues[1][1]).indexOf('v2:') === 0);
 check('ووقت آخر تغيّر يبقى كما هو', MIG.printValues[1][2] === '2026-09-12 22:01:45');
+
+console.log('\n35) ترتيب «اليوم»: الفرع ⇒ التاريخ ⇒ الحالة ⇒ رقم الفاتورة');
+const rowB = function (st, sBr, vBr, date, inv) { const r = new Array(17).fill(''); r[0] = st; r[2] = inv || ''; r[3] = date || ''; r[6] = vBr || ''; r[7] = sBr || ''; return r; };
+const seed35 = function (rows, order) {
+  const ks = rows.map(function (_, i) { return 'K' + i; });
+  return buildToday([['مفتاح الصف', 'البصمة', 'آخر تغيّر (الرياض)']], rows, ks, '2026-09-13 01:00:00', 0, H17, order);
+};
+const bodyOf = function (S) { return S.todayValues.slice(1).filter(function (r) { return String(r[0]) !== 'لا تغييرات اليوم'; }); };
+const brLabel = function (r) { return String(r[7] || '').trim() || String(r[6] || '').trim() || '(بلا فرع)'; };
+const contiguous35 = function (seq) { const seen = []; let last = null; for (let i = 0; i < seq.length; i++) { const v = seq[i]; if (v !== last) { if (seen.indexOf(v) >= 0) return false; seen.push(v); last = v; } } return true; };
+
+let S35 = seed35([
+  rowB('✅ مطابق', 'Dhahrat Laban', '', '2026-09-11', 'i1'),
+  rowB('✅ مطابق', 'Al Yasmin', '', '2026-09-11', 'i2'),
+  rowB('✅ مطابق', 'Al Masiaf', '', '2026-09-11', 'i3'),
+  rowB('✅ مطابق', 'Al Khaleej', '', '2026-09-11', 'i4'),
+  rowB('✅ مطابق', 'Al Wisham', '', '2026-09-11', 'i5'),
+  rowB('✅ مطابق', 'Al Yasmin', '', '2026-09-10', 'i6'),
+  rowB('✅ مطابق', 'Al Masiaf', '', '2026-09-10', 'i7')]);
+check('الفروع بالترتيب المعلَن',
+  bodyOf(S35).map(brLabel).join(',') === 'Al Masiaf,Al Masiaf,Al Wisham,Al Khaleej,Al Yasmin,Al Yasmin,Dhahrat Laban', bodyOf(S35).map(brLabel));
+check('صفوف كل فرع متجاورة', contiguous35(bodyOf(S35).map(brLabel)));
+
+S35 = seed35([
+  rowB('✅ مطابق', 'Al Khaleej', '', '2026-09-09', 'a'),
+  rowB('🔍 يحتاج مراجعتي', 'Al Khaleej', '', '2026-09-11', 'b'),
+  rowB('✅ مطابق', 'Al Khaleej', '', '2026-09-10', 'c'),
+  rowB('⚠️ فيه فرق', 'Al Khaleej', '', '2026-09-11', 'd'),
+  rowB('✅ مطابق', 'Al Khaleej', '', '', 'e')]);
+check('التواريخ تنازلياً والفارغ آخر مجموعات فرعه',
+  bodyOf(S35).map(function (r) { return String(r[3] || '(فارغ)'); }).join(',') === '2026-09-11,2026-09-11,2026-09-10,2026-09-09,(فارغ)');
+check('كل تاريخ متجاور', contiguous35(bodyOf(S35).map(function (r) { return String(r[3]); })));
+check('التاريخ يُقارن كتاريخ لا كنص',
+  bodyOf(seed35([rowB('✅ مطابق', 'Al Khaleej', '', '2026-9-9', 'x'), rowB('✅ مطابق', 'Al Khaleej', '', '2026-09-10', 'y')])).map(function (r) { return r[2]; }).join(',') === 'y,x');
+
+S35 = seed35([
+  rowB('✅ مطابق', 'Al Wisham', '', '2026-09-11', 'a'),
+  rowB('🔵 قراءة ضعيفة', 'Al Wisham', '', '2026-09-11', 'b'),
+  rowB('🚨 طلب بلا فاتورة سماك', 'Al Wisham', '', '2026-09-11', 'c'),
+  rowB('🔍 يحتاج مراجعتي', 'Al Wisham', '', '2026-09-11', 'd'),
+  rowB('⚠️ فيه فرق', 'Al Wisham', '', '2026-09-11', 'e')]);
+check('داخل (فرع + تاريخ): 🚨 ⚠️ 🔍 🔵 ✅',
+  bodyOf(S35).map(function (r) { return rankOf(r[0]); }).join(',') === '0,1,2,3,4');
+
+S35 = seed35([
+  rowB('✅ مطابق', 'Al Yasmin', '', '2026-09-11', 'qwf-5-1135'),
+  rowB('✅ مطابق', 'Al Yasmin', '', '2026-09-11', 'qwf-5-1130'),
+  rowB('✅ مطابق', 'Al Yasmin', '', '2026-09-11', 'qwd-5-1300'),
+  rowB('✅ مطابق', 'Al Yasmin', '', '2026-09-11', '')]);
+check('تساوي الثلاثة ⇒ رقم الفاتورة تصاعدياً والفارغ آخراً',
+  bodyOf(S35).map(function (r) { return String(r[2] || '(فارغ)'); }).join(',') === 'qwd-5-1300,qwf-5-1130,qwf-5-1135,(فارغ)');
+
+S35 = seed35([
+  rowB('✅ مطابق', 'AL  YASMIN', '', '2026-09-11', 'a'),
+  rowB('✅ مطابق', 'الياسمين', '', '2026-09-11', 'b'),
+  rowB('✅ مطابق', 'Al-Yasmin', '', '2026-09-11', 'c'),
+  rowB('✅ مطابق', 'ياسمين', '', '2026-09-11', 'd'),
+  rowB('✅ مطابق', 'Al Khaleej', '', '2026-09-11', 'e'),
+  rowB('✅ مطابق', 'الخليج ', '', '2026-09-11', 'f')]);
+check('صيغ الكتابة المختلفة تُجمع في فرع واحد', bodyOf(S35).map(function (r) { return r[2]; }).join(',') === 'e,f,a,b,c,d');
+check('ولا تُحسب فرعاً مجهولاً', Object.keys(S35.stats.unknownBranches).length === 0, S35.stats.unknownBranches);
+check('فرع سماك هو المعتمد وإلا الفيديو',
+  bodyOf(seed35([rowB('✅ مطابق', '', 'Al Masiaf', '2026-09-11', 'a'), rowB('✅ مطابق', 'Al Khaleej', 'Al Masiaf', '2026-09-11', 'b')])).map(function (r) { return r[2]; }).join(',') === 'a,b');
+
+S35 = seed35([
+  rowB('🚨 طلب بلا فاتورة سماك', 'Mugo Land', '', '2026-09-12', 'z1'),
+  rowB('✅ مطابق', '', '', '2026-09-12', 'z2'),
+  rowB('✅ مطابق', 'Al Masiaf', '', '2026-09-01', 'a'),
+  rowB('✅ مطابق', 'ظهرة لبن', '', '2026-09-01', 'b'),
+  rowB('🔵 قراءة ضعيفة', 'فرع جديد', '', '2026-09-12', 'z3')]);
+check('المجهول والفارغ بعد الفروع المعلَنة كلها', bodyOf(S35).map(function (r) { return r[2]; }).slice(0, 2).join(',') === 'a,b');
+check('ولا يُسقط أي صف', bodyOf(S35).length === 5);
+check('الأسماء المجهولة تُسرد حرفياً', S35.stats.unknownBranches['Mugo Land'] === 1 && S35.stats.unknownBranches['فرع جديد'] === 1, S35.stats.unknownBranches);
+check('والفارغ يُعدّ بلا اسم', S35.stats.noBranchRows === 1);
+
+const ROWS6 = [rowB('✅ مطابق', 'Al Narjis', '', '2026-09-11', 'n'), rowB('✅ مطابق', 'Dhahrat Laban', '', '2026-09-11', 'l'), rowB('✅ مطابق', 'Al Masiaf', '', '2026-09-11', 'm')];
+const SIXTH = { name: 'النرجس', aliases: ['النرجس', 'Al Narjis', 'Narjis', '6'] };
+const B6 = seed35(ROWS6);
+check('قبل إعلانه: النرجس مجهول وآخر الجدول',
+  bodyOf(B6).map(function (r) { return r[2]; }).join(',') === 'm,l,n' && B6.stats.unknownBranches['Al Narjis'] === 1);
+const A6 = seed35(ROWS6, DEFAULT_BRANCH_ORDER.concat([SIXTH]));
+check('بعد إعلانه في الثوابت: يأخذ موضعه بلا تعديل منطق الفرز',
+  bodyOf(A6).map(function (r) { return r[2]; }).join(',') === 'm,l,n' && Object.keys(A6.stats.unknownBranches).length === 0);
+const A6b = seed35(ROWS6, [SIXTH].concat(DEFAULT_BRANCH_ORDER));
+check('ولو وُضع أولاً في الثوابت تبعه الترتيب', bodyOf(A6b).map(function (r) { return r[2]; }).join(',') === 'n,m,l');
+check('أسماء الفروع في الإحصاء تأتي من الثوابت',
+  JSON.stringify(A6.stats.branchOrder) === JSON.stringify(['المصيف', 'الوشم', 'الخليج', 'الياسمين', 'ظهرة لبن', 'النرجس']));
 
 console.log('\n' + '='.repeat(60));
 if (failed) { console.log('سقطت ' + failed + ' حالة'); process.exit(1); }
