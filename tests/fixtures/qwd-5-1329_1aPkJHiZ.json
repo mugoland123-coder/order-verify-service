@@ -1,0 +1,41 @@
+{
+  "_source": "سجل استخراج الفيديو — معرّف الملف 1aPkJHiZldcKsvdGSQjQoHaRoHqocT_8R / WhatsApp Video 2026-09-11 at 1.19.07 PM.mp4 — فاتورة سماك qwd-5-1329",
+  "order_code": "5196321610044564",
+  "platform": "keeta",
+  "branch": "Al Khaleej",
+  "order_date": "2026-09-11",
+  "evidence_medium": "printed_receipt",
+  "items_count": 3,
+  "subtotal": 94,
+  "delivery": 23,
+  "delivery_printed": true,
+  "total": 94,
+  "adjustments": [],
+  "currency": "SAR",
+  "lines": [
+    {"qty": 1, "name": "Attar Tea Anise Tea R626", "code": "R626", "weight_value": null, "weight_unit": null, "weight": null, "price": 27, "raw_text": "1X Attar Tea Anise Tea R626 ﷼27.00"},
+    {"qty": 1, "name": "Attar tea anise tea 1piece", "code": null, "weight_value": null, "weight_unit": null, "weight": null, "price": 0, "raw_text": "1X Attar tea anise tea 1piece ﷼0.00"},
+    {"qty": 1, "name": "Afghan Almonds R325", "code": "R325", "weight_value": null, "weight_unit": null, "weight": null, "price": 20, "raw_text": "1X Afghan Almonds R325 ﷼20.00"},
+    {"qty": 1, "name": "Afghan almonds 500 g", "code": null, "weight_value": 500, "weight_unit": "g", "weight": "500 g", "price": 20, "raw_text": "1X Afghan almonds 500 g ﷼20.00"},
+    {"qty": 1, "name": "Attar Tea Cumin And Lemon R625", "code": "R625", "weight_value": null, "weight_unit": null, "weight": null, "price": 27, "raw_text": "1X Attar Tea Cumin And Lemon R625 ﷼27.00"},
+    {"qty": 1, "name": "Attar tea cumin and lemon 1piece", "code": null, "weight_value": null, "weight_unit": null, "weight": null, "price": 0, "raw_text": "1X Attar tea cumin and lemon 1piece ﷼0.00"}
+  ],
+  "prepared_items": [
+    {"code": "R626", "name": "شاي العطار يانسون / Attar Tea Aniseed", "seen_count": 1, "label_weight": null, "label_weight_g": null},
+    {"code": "R325", "name": "لوز افغاني / Afghan Almonds", "seen_count": 2, "label_weight": "0.250", "label_weight_g": 250},
+    {"code": "R625", "name": "شاي العطار كمون وليمون / Cumin & Lemon", "seen_count": 1, "label_weight": null, "label_weight_g": null}
+  ],
+  "fulfillment": {
+    "coverage": "full",
+    "verdict": "matched",
+    "lines": [
+      {"code": "R626", "status": "matched", "note": "عبوة شاي الأنيسون ظهرت بوضوح في الإطارات 17-20 بملصق R626"},
+      {"code": "R325", "status": "matched", "note": "عبوتان من اللوز الأفغاني R325 ظهرتا معاً في إطارات 23-27 وهو ما يتوافق مع الطلب (500g)"},
+      {"code": "R625", "status": "matched", "note": "عبوة شاي الكمون والليمون ظهرت بوضوح في الإطارات 29-31 بملصق R625"}
+    ],
+    "counts": {"matched": 3, "missing": 0, "extra": 0, "weight_diff": 0, "not_seen": 0}
+  },
+  "order_source_hint": "not_applicable",
+  "confidence": "high",
+  "field_confidence": {"order_code": "high", "platform": "high", "branch": "high", "order_total": "high"}
+}

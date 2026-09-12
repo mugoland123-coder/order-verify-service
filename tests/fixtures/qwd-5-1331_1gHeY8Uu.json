@@ -1,0 +1,26 @@
+{
+  "_source": "سجل استخراج الفيديو — 1gHeY8UuxuI3-vk9iUrulLzuXzr-U0cuh / 20260911_144444.mp4 — فاتورة سماك qwd-5-1331",
+  "order_code": null, "platform": "keeta", "branch": "Al Khaleej", "order_date": "2026-09-11",
+  "evidence_medium": "printed_receipt", "items_count": 3,
+  "subtotal": 106, "delivery": 18, "delivery_printed": true, "total": 106, "adjustments": [], "currency": "SAR",
+  "lines": [
+    {"qty":1,"name":"Hibiscus R255","code":"R255","weight_value":null,"weight_unit":null,"weight":null,"price":23,"raw_text":"1X Hibiscus R255 ﷼23.00"},
+    {"qty":1,"name":"Hibiscus 150g","code":null,"weight_value":150,"weight_unit":"g","weight":"150g","price":0,"raw_text":"1X Hibiscus 150g ﷼0.00"},
+    {"qty":1,"name":"Mohammadi Rose R232","code":"R232","weight_value":null,"weight_unit":null,"weight":null,"price":56,"raw_text":"1X Mohammadi Rose R232 ﷼56.00"},
+    {"qty":1,"name":"Mohammadi Rose 100g","code":null,"weight_value":100,"weight_unit":"g","weight":"100g","price":0,"raw_text":"1X Mohammadi Rose 100g ﷼0.00"},
+    {"qty":1,"name":"Al Attar Pomegranate Tea R630","code":"R630","weight_value":null,"weight_unit":null,"weight":null,"price":27,"raw_text":"1X Al Attar Pomegranate Tea R630 ﷼27.00"},
+    {"qty":1,"name":"Al Attar Tea Pomegranate Tea 1piece","code":null,"weight_value":null,"weight_unit":null,"weight":null,"price":0,"raw_text":"1X Al Attar Tea Pomegranate Tea 1piece ﷼0.00"}
+  ],
+  "prepared_items": [
+    {"code":"R255","name":"كركدية","seen_count":1,"label_weight":"0.150"},
+    {"code":"R232","name":"ورد محمدي","seen_count":1,"label_weight":"0.100"},
+    {"code":"R630","name":"العطار رمان","seen_count":1,"label_weight":null}
+  ],
+  "fulfillment": {"coverage":"full","verdict":"matched","lines":[
+    {"code":"R255","status":"matched","note":"عبوة كركدية R255 بوزن 0.150 ظهرت بوضوح في إطارات 21-22"},
+    {"code":"R232","status":"matched","note":"عبوة ورد محمدي R232 بوزن 0.100 ظهرت بوضوح في إطارات 24-28"},
+    {"code":"R630","status":"matched","note":"علبة العطار رمان R630 ظهرت بوضوح في إطارات 30-31"}],
+    "counts":{"matched":3,"missing":0,"extra":0,"weight_diff":0,"not_seen":0}},
+  "order_source_hint": "not_applicable", "confidence": "high",
+  "field_confidence": {"order_code":"low","platform":"high","branch":"high","order_total":"high"}
+}

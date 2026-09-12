@@ -1,0 +1,41 @@
+{
+  "_source": "سجل استخراج الفيديو — معرّف الملف 1WKMQJhMAkVAyIaotq79YuNE3DKFeiwpx / VID_20260911_003453.mp4 / استُخرج 2026-09-12 11:00 — فاتورة سماك qwd-5-1323",
+  "order_code": "1572640361",
+  "platform": "hunger",
+  "branch": null,
+  "order_date": null,
+  "evidence_medium": "app_screen",
+  "items_count": 2,
+  "subtotal": null,
+  "delivery": null,
+  "delivery_printed": false,
+  "total": null,
+  "adjustments": [],
+  "currency": "SAR",
+  "lines": [
+    {"qty": 1, "name": "Colored Nuts 250g", "code": "R856", "weight_value": 250, "weight_unit": "g", "weight": null, "price": 15, "raw_text": "Colored Nuts 250g SAR 15.00"},
+    {"qty": 1, "name": "Japanese Mixed Nuts 250g", "code": null, "weight_value": 250, "weight_unit": "g", "weight": null, "price": 29.98, "raw_text": "Japanese Mixed Nuts 250g SAR 29.98"}
+  ],
+  "prepared_items": [
+    {"code": "R856", "name": "مكسرات ملونة", "seen_count": 1, "label_weight": "0.250", "label_weight_g": 250},
+    {"code": "R76", "name": "مكسرات يابانية مشكلة", "seen_count": 1, "label_weight": "0.250", "label_weight_g": 250}
+  ],
+  "label_sightings": [
+    {"frame": 34, "t": "15.922", "code": "R856", "positions": ["وسط"]},
+    {"frame": 37, "t": "17.327", "code": "R76", "positions": ["وسط أعلى"]},
+    {"frame": 40, "t": "18.731", "code": "R76", "positions": ["أعلى"]},
+    {"frame": 40, "t": "18.731", "code": "R856", "positions": ["أسفل"]}
+  ],
+  "fulfillment": {
+    "coverage": "full",
+    "verdict": "matched",
+    "lines": [
+      {"code": "R856", "status": "matched", "note": "عبوة واحدة بملصق R856 وزن 0.250 ظهرت في الإطارات 34-40"},
+      {"code": "R76", "status": "matched", "note": "عبوة واحدة بملصق R76 وزن 0.250 ظهرت في الإطارات 37-40، يطابق Japanese Mixed Nuts 250g"}
+    ],
+    "counts": {"matched": 2, "missing": 0, "extra": 0, "weight_diff": 0, "not_seen": 0}
+  },
+  "order_source_hint": "not_applicable",
+  "confidence": "medium",
+  "field_confidence": {"order_code": "high", "platform": "high", "branch": "low", "order_total": "low"}
+}

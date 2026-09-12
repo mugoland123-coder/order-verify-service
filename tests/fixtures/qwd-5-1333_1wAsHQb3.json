@@ -1,0 +1,22 @@
+{
+  "_source": "سجل استخراج الفيديو — 1wAsHQb3cTZYRXmaM914hBQtiglR1sV6J / 20260911_180503.mp4 — فاتورة سماك qwd-5-1333",
+  "order_code": null, "platform": "keeta", "branch": "Al Khaleej", "order_date": "2026-09-11",
+  "evidence_medium": "printed_receipt", "items_count": 2,
+  "subtotal": 62, "delivery": 18, "delivery_printed": true, "total": 62, "adjustments": [], "currency": "SAR",
+  "lines": [
+    {"qty":1,"name":"Attar Ginger Lemon Honey Tea R619","code":"R619","weight_value":null,"weight_unit":null,"weight":null,"price":27,"raw_text":"1X Attar Ginger Lemon Honey Tea R619 ﷼27.00"},
+    {"qty":1,"name":"Attar tea ginger lemon honey 1piece","code":null,"weight_value":null,"weight_unit":null,"weight":null,"price":0,"raw_text":"1X Attar tea ginger lemon honey 1piece ﷼0.00"},
+    {"qty":1,"name":"Viola Naturals Dandelion Tea 24 Bags R870","code":"R870","weight_value":null,"weight_unit":null,"weight":null,"price":35,"raw_text":"1X Viola Naturals Dandelion Tea 24 Bags R870 ﷼35.00"},
+    {"qty":1,"name":"Viola Naturals Dandelion Tea 24 Bags","code":null,"weight_value":null,"weight_unit":null,"weight":null,"price":0,"raw_text":"1X Viola Naturals Dandelion Tea 24 Bags ﷼0.00"}
+  ],
+  "prepared_items": [
+    {"code":"R619","name":"Attar tea with ginger, lemon, and honey","seen_count":1,"label_weight":null},
+    {"code":"R870","name":"Dandelion Drink (شاي الهندباء البري الطبيعي)","seen_count":1,"label_weight":null}
+  ],
+  "fulfillment": {"coverage":"full","verdict":"matched","lines":[
+    {"code":"R619","status":"matched","note":"عبوة واحدة بملصق R619 ظهرت بوضوح في إطارات 27-40"},
+    {"code":"R870","status":"matched","note":"عبوة واحدة بملصق R870 ظهرت بوضوح في إطارات 32-40"}],
+    "counts":{"matched":2,"missing":0,"extra":0,"weight_diff":0,"not_seen":0}},
+  "order_source_hint": "not_applicable", "confidence": "high",
+  "field_confidence": {"order_code":"low","platform":"high","branch":"high","order_total":"high"}
+}
