@@ -891,8 +891,25 @@ console.log('\n33) تبويب «اليوم» + «بصمات الصفوف»§ م�
 // نُسخت حرفياً من عقدة «بناء اليوم والبصمات».
 const TODAY_WIDTH = 17;
 const normCell = function (v) { return String(v === null || v === undefined ? '' : v).replace(/\r/g, '').replace(/\s+/g, ' ').trim(); };
-const fpOf = function (r) {
-  const cells = []; for (let i = 0; i < TODAY_WIDTH; i++) cells.push(normCell(r[i]));
+// البصمة تُقاس على القيمة المعنوية للخلية لا على تمثيلها (منشور b44f8e44)
+const URL_RE33 = /https?:\/\/[^\s"'<>)]+/gi;
+const idOfUrl = function (u) {
+  const s = String(u).replace(/[)"'\\.,;]+$/, '');
+  const m = s.match(/\/d\/([A-Za-z0-9_-]{10,})/) || s.match(/[?&]id=([A-Za-z0-9_-]{10,})/);
+  if (m) return 'drive:' + m[1];
+  return s.split('#')[0].split('?')[0].replace(/\/+$/, '').toLowerCase();
+};
+const semOf = function (v) {
+  const s = normCell(v);
+  if (s.charAt(0) !== '=') return s;
+  const urls = s.match(URL_RE33) || [];
+  const ids = [];
+  urls.forEach(function (u) { const t = idOfUrl(u); if (t && ids.indexOf(t) < 0) ids.push(t); });
+  if (ids.length) return 'f|' + ids.join('|');
+  const lits = s.match(/"(?:[^"]|"")*"|-?\d+(?:\.\d+)?/g) || [];
+  return 'f|' + lits.map(function (t) { return normCell(t).replace(/^"|"$/g, '').replace(/""/g, '"'); }).join('|');
+};
+const hashOf = function (cells) {
   const s = cells.join(String.fromCharCode(31));
   let h1 = 0x811c9dc5 >>> 0, h2 = 0x01000193 >>> 0;
   for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i);
@@ -900,6 +917,8 @@ const fpOf = function (r) {
     h2 = (h2 + Math.imul(c, 131)) >>> 0; h2 = ((h2 ^ (h2 << 7)) >>> 0); }
   return ('00000000' + h1.toString(16)).slice(-8) + ('00000000' + h2.toString(16)).slice(-8) + '-' + s.length;
 };
+const fpOf = function (r) { const c = []; for (let i = 0; i < TODAY_WIDTH; i++) c.push(semOf(r[i])); return 'v2:' + hashOf(c); };
+const fpLegacyOf = function (r) { const c = []; for (let i = 0; i < TODAY_WIDTH; i++) c.push(normCell(r[i])); return hashOf(c); };
 const RANK = [['🚨', 0], ['⚠️', 1], ['🔍', 2], ['🔵', 3], ['✅', 4]];
 const rankOf = function (s) { const t = String(s || ''); for (let i = 0; i < RANK.length; i++) { if (t.indexOf(RANK[i][0]) === 0) return RANK[i][1]; } return 9; };
 // دالة التطبيع الواحدة القائمة في «Build Orders Table» @199 — المفتاح يُبنى منها لا من نسخة ثانية
@@ -917,12 +936,16 @@ function buildToday(prevPrints, rows, keys, now, prevTodayRows, header) {
     const k = normCell(keys[i]); if (!k) return;
     if (seen[k]) { dup++; return; }
     seen[k] = 1;
-    const fp = fpOf(r), old = prevMap[k];
-    const isNew = !old, changed = isNew || old.fp !== fp;
+    const fp = fpOf(r), fpLegacy = fpLegacyOf(r), old = prevMap[k];
+    const isNew = !old;
+    const oldFp = old ? String(old.fp || '') : '';
+    const legacyStored = !!old && oldFp.indexOf('v2:') !== 0;
+    const changed = isNew || (legacyStored ? (oldFp !== fpLegacy) : (oldFp !== fp));
     if (isNew) nNew++; else if (changed) nChanged++; else nSame++;
     const at = changed ? TS : (old.at || TS);
     outPrints.push([k, fp, at]);
-    if (String(at).slice(0, 10) === TODAY) todayRows.push({ r: r, at: at, st: String(r[0] || '') });
+    // «اليوم» سجل تغييرات لا مرآة: يدخله الصف الجديد أو المتغيّر وحده
+    if (changed) todayRows.push({ r: r, at: at, st: String(r[0] || '') });
   });
   let kept = 0;
   Object.keys(prevMap).forEach(function (k) { if (seen[k]) return; kept++; outPrints.push([k, prevMap[k].fp, prevMap[k].at]); });
@@ -931,8 +954,12 @@ function buildToday(prevPrints, rows, keys, now, prevTodayRows, header) {
   if (todayRows.length) todayRows.forEach(function (x) { const rr = x.r.slice(); while (rr.length < TODAY_WIDTH) rr.push(''); todayValues.push(rr.slice(0, TODAY_WIDTH)); });
   else { const b = new Array(TODAY_WIDTH).fill(''); b[0] = 'لا تغييرات اليوم'; b[14] = 'آخر تحديث: ' + TS + ' (الرياض)'; todayValues.push(b); }
   while (todayValues.length < prevTodayRows) todayValues.push(new Array(TODAY_WIDTH).fill(''));
-  return { todayValues: todayValues, printValues: [['مفتاح الصف', 'البصمة', 'آخر تغيّر (الرياض)']].concat(outPrints),
-    stats: { newKeys: nNew, changedKeys: nChanged, unchanged: nSame, todayCount: todayRows.length, keptAbsent: kept, duplicateKeys: dup } };
+  const expectedToday = nNew + nChanged, actualToday = todayRows.length, guardOk = actualToday === expectedToday;
+  const printValues = [['مفتاح الصف', 'البصمة', 'آخر تغيّر (الرياض)']].concat(outPrints);
+  return { writeToday: guardOk, writePrints: guardOk,
+    todayValues: guardOk ? todayValues : [], printValues: guardOk ? printValues : [],
+    stats: { newKeys: nNew, changedKeys: nChanged, unchanged: nSame, todayCount: actualToday,
+      expectedToday: expectedToday, guardOk: guardOk, keptAbsent: kept, duplicateKeys: dup } };
 }
 
 const H17 = ['الحالة', 'رابط الفيديو', 'رقم فاتورة سماك', 'التاريخ', 'المنصة (من الفيديو)', 'المنصة (من سماك)',
@@ -989,11 +1016,12 @@ check('ولا يدخل «اليوم»', S.stats.todayCount === 0);
 check('بصمته ووقتها لم يُمسّا',
   S.printValues[6][1] === 'deadbeefdeadbeef-9' && S.printValues[6][2] === '2026-09-05 10:00:00');
 
+// القاعدة الجديدة (b44f8e44): «اليوم» سجل تغييرات لا مرآة — الوقت لم يعد يُدخل صفاً
 const prevToday = [['مفتاح الصف', 'البصمة', 'آخر تغيّر (الرياض)']].concat(keys.map(function (k, i) { return [k, fpOf(rows[i]), '2026-09-12 09:00:00']; }));
 S = buildToday(prevToday, rows, keys, NOW, 6, H17);
-check('تغيّر في تشغيل سابق من اليوم نفسه يبقى في «اليوم»', S.stats.changedKeys === 0 && S.stats.todayCount === 5);
+check('صف تغيّر في تشغيل سابق ولم يتغيّر الآن لا يدخل «اليوم»', S.stats.changedKeys === 0 && S.stats.todayCount === 0);
 S = buildToday(prevSame, rows, keys, '2026-09-13 00:10:00', 6, H17);
-check('بعد منتصف الليل يفرغ التبويب تلقائياً', S.stats.todayCount === 0 && S.todayValues[1][0] === 'لا تغييرات اليوم');
+check('لا شيء يتغيّر ⇒ «اليوم» فارغ بسطره', S.stats.todayCount === 0 && S.todayValues[1][0] === 'لا تغييرات اليوم');
 
 const dupKeys = keys.slice(); dupKeys[4] = dupKeys[0];
 S = buildToday(prevSame, rows, dupKeys, NOW, 6, H17);
@@ -1017,6 +1045,72 @@ check('إضافة عمود ثامن عشر§ التفريغ يتبع بلا تع
   PB.slice(1).every(function (r) { return r.length === 18 && r[17] === ''; }), PB[1] && PB[1].length);
 check('لا خلية في نطاق الترويسة تحمل قيمة من تشغيل أقدم',
   padBody([H17], 2, H17)[1].filter(function (c, i) { return c === OLD[i]; }).length === 0);
+
+console.log('\n34) البصمة على المعنى + «اليوم» سجل تغييرات + حارس العدد (منشور b44f8e44)');
+const hlink = function (id, sep, label) {
+  return '=HYPERLINK("https://drive.google.com/file/d/' + id + '/view"' + sep + '"' + (label || 'WhatsApp Video.mp4') + '")';
+};
+const rowL = function (id, sep, inv, st, why) {
+  const r = new Array(17).fill(''); r[0] = st || '✅ مطابق'; r[1] = hlink(id, sep); r[2] = inv; r[14] = why || ''; return r;
+};
+const ID1 = '1z-6BRcBl5ZouvwRW73GbSwv3j_0vA_1Q';
+const PH34 = ['مفتاح الصف', 'البصمة', 'آخر تغيّر (الرياض)'];
+
+// (أ) الفاصل داخل صيغة الرابط تمثيل لا معنى
+check('فاصلة أو فاصلة منقوطة داخل HYPERLINK ⇒ بصمة واحدة',
+  fpOf(rowL(ID1, ';', 'qwf-5-1130')) === fpOf(rowL(ID1, ',', 'qwf-5-1130')));
+check('اسم الملف المعروض لا يدخل البصمة',
+  fpOf(rowL(ID1, ';', 'qwf-5-1130')) === fpOf((function () { const r = rowL(ID1, ';', 'qwf-5-1130'); r[1] = hlink(ID1, ';', 'اسم آخر تماماً.mp4'); return r; })()));
+check('تغيّر معرّف Drive ⇒ بصمة مختلفة',
+  fpOf(rowL(ID1, ';', 'qwf-5-1130')) !== fpOf(rowL('1BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', ';', 'qwf-5-1130')));
+check('تغيّر عمود عادي ⇒ بصمة مختلفة',
+  fpOf(rowL(ID1, ';', 'qwf-5-1130')) !== fpOf(rowL(ID1, ';', 'qwf-5-1130', 'سبب جديد')));
+
+// (ب) 171 بلا تغيير و4 متغيّرة ⇒ «اليوم» 4 لا 175
+const mk34 = function (n, sep) { const a = []; for (let i = 0; i < n; i++) a.push(rowL('1FILE' + String(i) + 'xxxxxxxxxxxxxxxxxxxxxxxxxxx', sep, 'inv-' + i)); return a; };
+const K34 = []; for (let i = 0; i < 175; i++) K34.push('FILE:k' + i);
+const before34 = mk34(175, ';');
+const seed34 = buildToday([PH34], before34, K34, '2026-09-12 21:04:11', 0, H17);
+check('البذرة ⇒ 175 جديدة و«اليوم» 175', seed34.stats.newKeys === 175 && seed34.stats.todayCount === 175);
+const after34 = before34.map(function (r) { return r.slice(); });
+after34[0][1] = hlink('1FILE0xxxxxxxxxxxxxxxxxxxxxxxxxxx', ',');
+after34[1][1] = hlink('1FILE1xxxxxxxxxxxxxxxxxxxxxxxxxxx', ',');
+[10, 11, 12, 13].forEach(function (i) { after34[i][14] = 'سبب جديد ' + i; });
+const S34 = buildToday(seed34.printValues, after34, K34, '2026-09-12 22:01:45', 176, H17);
+check('تمثيل مختلف لا يُحسب تغيّراً، و4 حقيقية فقط',
+  S34.stats.changedKeys === 4 && S34.stats.newKeys === 0 && S34.stats.unchanged === 171, S34.stats);
+check('«اليوم» 4 صفوف لا 175', S34.stats.todayCount === 4);
+check('المكتوب يساوي changed + new', S34.stats.todayCount === S34.stats.changedKeys + S34.stats.newKeys && S34.stats.guardOk === true);
+check('بقية الصفوف تُمسح بالحشو', S34.todayValues.length === 176);
+
+// (ج) كل الصفوف بلا تغيير ⇒ «اليوم» فارغ بسطره
+const S34b = buildToday(S34.printValues, after34, K34, '2026-09-12 23:00:05', 176, H17);
+check('لا تغييرات ⇒ صفر، وسطر «لا تغييرات اليوم»',
+  S34b.stats.todayCount === 0 && S34b.stats.guardOk === true && S34b.todayValues[1][0] === 'لا تغييرات اليوم');
+
+// (د) الحارس: نسخة تختار بمنطق الوقت القديم ⇒ يمنع الكتابة
+function buildTodayBuggy(prevPrints, rows, keys, now, prevTodayRows, header) {
+  const S = buildToday(prevPrints, rows, keys, now, prevTodayRows, header);
+  const TODAY = String(now).slice(0, 10);
+  let picked = 0;
+  S.printValues.slice(1).forEach(function (r) { if (String(r[2]).slice(0, 10) === TODAY) picked++; });
+  const guardOk = picked === S.stats.newKeys + S.stats.changedKeys;
+  return { writeToday: guardOk, writePrints: guardOk, todayValues: guardOk ? S.todayValues : [], printValues: guardOk ? S.printValues : [],
+    stats: { newKeys: S.stats.newKeys, changedKeys: S.stats.changedKeys, todayCount: picked, expectedToday: S.stats.newKeys + S.stats.changedKeys, guardOk: guardOk } };
+}
+const BUG = buildTodayBuggy(seed34.printValues, after34, K34, '2026-09-12 22:01:45', 176, H17);
+check('النسخة المعيبة تختار 175 والمتوقع 4', BUG.stats.todayCount === 175 && BUG.stats.expectedToday === 4, BUG.stats);
+check('الحارس يمنع كتابة «اليوم» والبصمات معاً', BUG.guardOk !== true && BUG.writeToday === false && BUG.writePrints === false);
+check('ولا تُرسَل أي قيم للكتابة', BUG.todayValues.length === 0 && BUG.printValues.length === 0);
+
+// (هـ) ترقية البصمة المخزَّنة v1 ⇒ v2 بلا اعتبارها تغييراً
+const RM = rowL('1MIGRATExxxxxxxxxxxxxxxxxxxxxxxx', ',', 'qwf-5-1135');
+const prevLegacy = [PH34, ['K1', fpLegacyOf(RM), '2026-09-12 22:01:45']];
+const MIG = buildToday(prevLegacy, [RM], ['K1'], '2026-09-12 23:00:05', 2, H17);
+check('بصمة قديمة مطابقة ⇒ unchanged لا changed', MIG.stats.unchanged === 1 && MIG.stats.changedKeys === 0, MIG.stats);
+check('ولا تدخل «اليوم»', MIG.stats.todayCount === 0);
+check('وتُخزَّن بالصيغة الجديدة v2', String(MIG.printValues[1][1]).indexOf('v2:') === 0);
+check('ووقت آخر تغيّر يبقى كما هو', MIG.printValues[1][2] === '2026-09-12 22:01:45');
 
 console.log('\n' + '='.repeat(60));
 if (failed) { console.log('سقطت ' + failed + ' حالة'); process.exit(1); }
