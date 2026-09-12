@@ -762,18 +762,25 @@ def _bottom_verdict(top, cur):
     sim = _name_sim(top.get("raw_name") or top.get("name"),
                     cur.get("raw_name") or cur.get("name"))
     qty_ok = cur.get("qty") in (None, 1)
+    # قاعدة صاحبة النظام (2026-09-12): وصف يحمل نفس كود R للمنتج الذي فوقه
+    # ليس بنداً مستقلاً أبداً — يُدمج فيه مهما اختلف الاسم أو لغته.
+    # (الاستثناء الوحيد فوق: نفس الكود + نفس الوزن + نفس السعر = حبتان مستقلتان.)
+    if ccode and pcode and ccode == pcode:
+        if qty_ok:
+            return "merge", ""
+        return "note", ("سطر بنفس الكود كميته %s وليست 1X فلم يُدمج: «%s»"
+                        % (cur.get("qty"), _line_label(cur)))
     if sim >= _NAME_SIM_MIN:
         if qty_ok:
             return "merge", ""
         return "note", ("سطر خيار وزن كميته %s وليست 1X فلم يُدمج: «%s»"
                         % (cur.get("qty"), _line_label(cur)))
-    if qty_ok and _has_weight_token(cur) and not _has_weight_token(top):
+    if qty_ok and not ccode:
+        # اسم مختلف (وقد يكون بلغة أخرى): لا يُحسم بتشابه الحروف.
+        # «N Items» المطبوع هو الحكم — يؤكد الدمج أو يؤكد الاستقلال، في _assemble_products.
         return "merge_if_count", (
             "اسم السطر السفلي مختلف (تشابه %.2f) ولا يوجد عدد منتجات للتأكيد: «%s»"
             % (sim, _line_label(cur)))
-    if not ccode:
-        return "note", ("سطر بلا كود R ولا يطابق اسم المنتج فوقه (تشابه %.2f): «%s»"
-                        % (sim, _line_label(cur)))
     return "product", ""
 
 
@@ -825,7 +832,7 @@ def _assemble_products(lines, items_count):
     تشابه أقل من الحد لا يُدمج إلا إذا كان «N Items» مقروءاً ومطابقاً لعدد المنتجات بعد الدمج؛
     وإن لم يكن مقروءاً فلا دمج، ويُسجَّل السبب صريحاً (المبلغ لا يميّز الدمج في منتج 1X).
     """
-    plan, notes = [], []
+    plan, notes, tent_notes = [], [], []
     i, n = 0, len(lines)
     while i < n:
         bottom_idx, tentative = None, False
@@ -835,7 +842,7 @@ def _assemble_products(lines, items_count):
                 bottom_idx = i + 1
             elif verdict == "merge_if_count":
                 bottom_idx, tentative = i + 1, True
-                notes.append(note)
+                tent_notes.append(note)
             elif verdict == "note":
                 notes.append(note)
         plan.append((i, bottom_idx, tentative))
@@ -857,13 +864,14 @@ def _assemble_products(lines, items_count):
     prods_without, notes_without = build(False)
     if items_count is None:
         # لا عدد منتجات مطبوع: لا دمج، والسبب يبقى ظاهراً فيسقط lines_merged_cleanly
-        return prods_without, notes + notes_without
+        return prods_without, notes + tent_notes + notes_without
     if len(prods_with) == int(items_count):
-        kept = [x for x in notes if "ولا يوجد عدد منتجات للتأكيد" not in x]
-        return prods_with, kept + notes_with
+        # العدد المطبوع يؤكد الدمج
+        return prods_with, notes + notes_with
     if len(prods_without) == int(items_count):
+        # العدد المطبوع يؤكد أن السطر منتج مستقل — تأكيد حسابي، فتسقط الملاحظة المؤقتة
         return prods_without, notes + notes_without
-    return prods_without, notes + notes_without
+    return prods_without, notes + tent_notes + notes_without
 
 
 def _reference_sum(subtotal, delivery, delivery_printed, total):
@@ -891,6 +899,73 @@ def _norm_adjustments(raw):
         if label or amount is not None:
             out.append({"label": label[:80], "amount": amount})
     return out
+
+
+def _label_code_candidates(fulfillment, prepared_items, used_codes):
+    """أكواد رآها الفيديو على الملصقات ولم يُسندها التطبيق إلى أي بند."""
+    out = []
+    for ln in ((fulfillment or {}).get("lines") or []):
+        code = str(ln.get("code") or "").strip()
+        if code and code not in used_codes:
+            out.append({"code": code, "note": str(ln.get("note") or ""),
+                        "weight_g": None, "name": ""})
+    seen = set(x["code"] for x in out)
+    for p in (prepared_items or []):
+        code = str(p.get("code") or "").strip()
+        if code and code not in used_codes and code not in seen:
+            out.append({"code": code, "note": "", "name": str(p.get("name") or ""),
+                        "weight_g": _num(p.get("label_weight_g"))})
+            seen.add(code)
+    for x in out:
+        if x["weight_g"] is None:
+            for p in (prepared_items or []):
+                if str(p.get("code") or "").strip() == x["code"]:
+                    x["weight_g"] = _num(p.get("label_weight_g"))
+                    x["name"] = x["name"] or str(p.get("name") or "")
+                    break
+    return out
+
+
+def _adopt_label_codes(items, fulfillment, prepared_items):
+    """
+    بند مقروء من شاشة التطبيق بلا كود R، والعبوة نفسها ظهرت في الفيديو بملصق يحمل كوداً:
+    يُتبنّى كود الملصق للبند. لا تخمين — يُشترط مرشح واحد لا غير:
+      (أ) سطر تحقّق تحضير واحد فقط يذكر اسم البند حرفياً في ملاحظته، أو
+      (ب) كود ملصق واحد فقط بنفس وزن العبوة، ولا بند آخر بلا كود بنفس الوزن ينازعه.
+    يُسجَّل المصدر في code_source حتى يبقى الأثر ظاهراً.
+    """
+    blanks = [p for p in items if not p.get("code")]
+    if not blanks:
+        return []
+    used = set(str(p.get("code")) for p in items if p.get("code"))
+    cands = _label_code_candidates(fulfillment, prepared_items, used)
+    if not cands:
+        return []
+    adopted = []
+    for it in blanks:
+        name = _name_key(it.get("name"))
+        if not name:
+            continue
+        by_note = [c for c in cands if c["code"] not in used
+                   and name and name in _name_key(c["note"])]
+        pick = by_note[0] if len(by_note) == 1 else None
+        if pick is None:
+            qty = it.get("quantity") or 1
+            tw = _num(it.get("total_weight_g"))
+            unit_w = None if tw is None else round(tw / (qty or 1), 2)
+            if unit_w is not None:
+                rivals = [b for b in blanks if b is not it and not b.get("code")
+                          and _num(b.get("total_weight_g")) is not None
+                          and round(_num(b.get("total_weight_g")) / (b.get("quantity") or 1), 2) == unit_w]
+                by_w = [c for c in cands if c["code"] not in used and c["weight_g"] == unit_w]
+                if len(by_w) == 1 and not rivals:
+                    pick = by_w[0]
+        if pick is not None:
+            it["code"] = pick["code"]
+            it["code_source"] = "label"
+            used.add(pick["code"])
+            adopted.append({"code": pick["code"], "name": it.get("name")})
+    return adopted
 
 
 def normalize_result(parsed):
@@ -963,6 +1038,7 @@ def normalize_result(parsed):
 
     prepared_items = _norm_prepared_items(parsed.get("prepared_items"))
     fulfillment = _norm_fulfillment(parsed.get("fulfillment"), prepared_items)
+    label_codes = _adopt_label_codes(items, fulfillment, prepared_items)
 
     field_confidence = {
         "order_code": _norm_conf(field_conf.get("order_code")) if order_code else "low",
@@ -991,6 +1067,7 @@ def normalize_result(parsed):
         "lines": raw_lines,
         "lines_source": lines_source,
         "merge_notes": merge_notes,
+        "label_codes": label_codes,
         "items": items,
         "evidence_medium": medium,
         "platform_source": platform_source,
