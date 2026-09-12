@@ -139,9 +139,20 @@ r = run([
     L(1, "Something Completely Different", None, None, 10.00),
 ], subtotal=33.00, total=33.00, items_count=2)
 check("منتجان لا منتج", len(r["items"]) == 2, len(r["items"]))
-check("سُجّل سبب صريح", any("لا يطابق اسم المنتج" in n for n in r["merge_notes"]), r["merge_notes"])
-check("سقط lines_merged_cleanly", "lines_merged_cleanly" in r["self_check"]["failed"], r["self_check"]["failed"])
+# تحديث 2026-09-12: «N Items» المطبوع (2) يؤكد أن السطر منتج مستقل، فلا تبقى ملاحظة معلّقة.
+check("العدد المطبوع حسم الاستقلال فسقطت الملاحظة", r["merge_notes"] == [], r["merge_notes"])
+check("lines_merged_cleanly سليم بعد الحسم",
+      "lines_merged_cleanly" not in r["self_check"]["failed"], r["self_check"]["failed"])
 check("سقط all_codes", "all_codes" in r["self_check"]["failed"], r["self_check"]["failed"])
+
+print("\n6ب) نفس الحالة بلا «N Items» مطبوع — لا حسم فتبقى الملاحظة")
+r = run([
+    L(1, "Talbinah of the Prophet Sunnah R115", "R115", None, 23.00),
+    L(1, "Something Completely Different", None, None, 10.00),
+], subtotal=33.00, total=33.00)
+check("منتجان لا منتج", len(r["items"]) == 2, len(r["items"]))
+check("سُجّل سبب صريح", any("ولا يوجد عدد منتجات للتأكيد" in n for n in r["merge_notes"]), r["merge_notes"])
+check("سقط lines_merged_cleanly", "lines_merged_cleanly" in r["self_check"]["failed"], r["self_check"]["failed"])
 
 print("\n7) سطر سفلي بنفس كود العلوي — يُدمج")
 r = run([
