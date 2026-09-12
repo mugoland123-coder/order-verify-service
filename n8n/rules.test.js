@@ -887,6 +887,137 @@ check('النص يذكر المعرّفين ولا يكرر معرّفاً وا�
 check('أساس «الاسم+الحجم» يظهر كما هو', dupNote('الاسم+الحجم', 'x.mp4', 'i1', 'i2').indexOf('تطابق الاسم+الحجم') > 0);
 check('معرّف أصلي غير مسجّل يُكتب صراحةً', dupNote('وسم محفوظ من تشغيل سابق', 'x.mp4', 'i1', '').indexOf('غير مسجّل') > 0);
 
+console.log('\n33) تبويب «اليوم» + «بصمات الصفوف»§ مرآة لا مصدر حقيقة');
+// نُسخت حرفياً من عقدة «بناء اليوم والبصمات».
+const TODAY_WIDTH = 17;
+const normCell = function (v) { return String(v === null || v === undefined ? '' : v).replace(/\r/g, '').replace(/\s+/g, ' ').trim(); };
+const fpOf = function (r) {
+  const cells = []; for (let i = 0; i < TODAY_WIDTH; i++) cells.push(normCell(r[i]));
+  const s = cells.join(String.fromCharCode(31));
+  let h1 = 0x811c9dc5 >>> 0, h2 = 0x01000193 >>> 0;
+  for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i);
+    h1 = ((h1 ^ c) >>> 0); h1 = Math.imul(h1, 0x01000193) >>> 0;
+    h2 = (h2 + Math.imul(c, 131)) >>> 0; h2 = ((h2 ^ (h2 << 7)) >>> 0); }
+  return ('00000000' + h1.toString(16)).slice(-8) + ('00000000' + h2.toString(16)).slice(-8) + '-' + s.length;
+};
+const RANK = [['🚨', 0], ['⚠️', 1], ['🔍', 2], ['🔵', 3], ['✅', 4]];
+const rankOf = function (s) { const t = String(s || ''); for (let i = 0; i < RANK.length; i++) { if (t.indexOf(RANK[i][0]) === 0) return RANK[i][1]; } return 9; };
+// دالة التطبيع الواحدة القائمة في «Build Orders Table» @199 — المفتاح يُبنى منها لا من نسخة ثانية
+const normInvNo33 = function (v) { return String(v == null ? '' : v).trim().toLowerCase().replace(/\s+/g, ''); };
+const fileIdOf33 = function (s) { const m = String(s || '').match(/[-\w]{25,}/); return m ? m[0] : ''; };
+const keyOf = function (link, inv) { const f = fileIdOf33(link); return f ? ('FILE:' + f) : ('INV:' + normInvNo33(inv)); };
+
+function buildToday(prevPrints, rows, keys, now, prevTodayRows, header) {
+  const TS = now, TODAY = String(now).slice(0, 10);
+  const prevMap = {};
+  prevPrints.slice(1).forEach(function (r) { const k = normCell(r && r[0]); if (!k) return; prevMap[k] = { fp: String(r[1] || ''), at: String(r[2] || '') }; });
+  const seen = {}, outPrints = [], todayRows = [];
+  let nNew = 0, nChanged = 0, nSame = 0, dup = 0;
+  rows.forEach(function (r, i) {
+    const k = normCell(keys[i]); if (!k) return;
+    if (seen[k]) { dup++; return; }
+    seen[k] = 1;
+    const fp = fpOf(r), old = prevMap[k];
+    const isNew = !old, changed = isNew || old.fp !== fp;
+    if (isNew) nNew++; else if (changed) nChanged++; else nSame++;
+    const at = changed ? TS : (old.at || TS);
+    outPrints.push([k, fp, at]);
+    if (String(at).slice(0, 10) === TODAY) todayRows.push({ r: r, at: at, st: String(r[0] || '') });
+  });
+  let kept = 0;
+  Object.keys(prevMap).forEach(function (k) { if (seen[k]) return; kept++; outPrints.push([k, prevMap[k].fp, prevMap[k].at]); });
+  todayRows.sort(function (a, b) { return (rankOf(a.st) - rankOf(b.st)) || String(b.at).localeCompare(String(a.at)); });
+  const todayValues = [header];
+  if (todayRows.length) todayRows.forEach(function (x) { const rr = x.r.slice(); while (rr.length < TODAY_WIDTH) rr.push(''); todayValues.push(rr.slice(0, TODAY_WIDTH)); });
+  else { const b = new Array(TODAY_WIDTH).fill(''); b[0] = 'لا تغييرات اليوم'; b[14] = 'آخر تحديث: ' + TS + ' (الرياض)'; todayValues.push(b); }
+  while (todayValues.length < prevTodayRows) todayValues.push(new Array(TODAY_WIDTH).fill(''));
+  return { todayValues: todayValues, printValues: [['مفتاح الصف', 'البصمة', 'آخر تغيّر (الرياض)']].concat(outPrints),
+    stats: { newKeys: nNew, changedKeys: nChanged, unchanged: nSame, todayCount: todayRows.length, keptAbsent: kept, duplicateKeys: dup } };
+}
+
+const H17 = ['الحالة', 'رابط الفيديو', 'رقم فاتورة سماك', 'التاريخ', 'المنصة (من الفيديو)', 'المنصة (من سماك)',
+  'الفرع (من الفيديو)', 'الفرع (من سماك)', 'المنتجات (من الفيديو)', 'المنتجات (من سماك)', 'المحضَّر فعلياً',
+  'الإجمالي (من الفيديو)', 'الإجمالي (من سماك)', 'طريقة الدفع', 'السبب', 'نتيجة الفحص الذاتي', 'مصدر التاريخ'];
+const mkRow = function (st, link, inv, extra) { const r = new Array(17).fill(''); r[0] = st; r[1] = link; r[2] = inv; r[14] = extra || ''; return r; };
+const LINK = 'https://drive.google.com/file/d/1vorb6Qy2UNE63hJS_3sO8SDnLe4n57GV/view';
+
+check('المفتاح من معرّف الملف حين يوجد فيديو', keyOf(LINK, 'qwd-5-1') === 'FILE:1vorb6Qy2UNE63hJS_3sO8SDnLe4n57GV');
+check('المفتاح INV§ برقم مطبَّع حين لا فيديو', keyOf('', '  QWF-5-1101 ') === 'INV:qwf-5-1101');
+check('المفتاح لا يتغيّر بتغيّر باقي الخلايا',
+  keyOf(LINK, 'a') === keyOf(LINK, 'b'));
+check('الأصفار البادئة تبقى في المفتاح', keyOf('', '0005-12') === 'INV:0005-12');
+
+const R1 = mkRow('✅ مطابق', LINK, 'qwd-5-1');
+check('البصمة ثابتة لنفس القيم', fpOf(R1) === fpOf(R1.slice()));
+check('البصمة تتغيّر بتغيّر أي خلية', fpOf(R1) !== fpOf(mkRow('⚠️ فيه فرق', LINK, 'qwd-5-1')));
+check('فروق المسافات وحدها لا تغيّر البصمة',
+  fpOf(mkRow('✅ مطابق', LINK, 'qwd-5-1', 'سبب  ما')) === fpOf(mkRow('✅ مطابق', LINK, 'qwd-5-1', ' سبب ما ')));
+
+const rows = [mkRow('🚨 طلب بلا فاتورة سماك', 'https://x/d/AAAAAAAAAAAAAAAAAAAAAAAAAAA/v', ''),
+              mkRow('⚠️ فيه فرق', 'https://x/d/BBBBBBBBBBBBBBBBBBBBBBBBBBB/v', ''),
+              mkRow('🔍 يحتاج مراجعتي', '', 'inv-1'),
+              mkRow('🔵 قراءة ضعيفة', 'https://x/d/CCCCCCCCCCCCCCCCCCCCCCCCCCC/v', ''),
+              mkRow('✅ مطابق', 'https://x/d/DDDDDDDDDDDDDDDDDDDDDDDDDDD/v', '')];
+const keys = rows.map(function (r) { return keyOf(r[1], r[2]); });
+const NOW = '2026-09-12 20:00:00', YEST = '2026-09-11 22:10:00';
+
+let S = buildToday([['مفتاح الصف', 'البصمة', 'آخر تغيّر (الرياض)']], rows, keys, NOW, 0, H17);
+check('أول تشغيل§ كل الصفوف جديدة وتدخل «اليوم»', S.stats.newKeys === 5 && S.stats.todayCount === 5);
+check('ترويسة «اليوم» مطابقة لترويسة «الطلبات» حرفياً', JSON.stringify(S.todayValues[0]) === JSON.stringify(H17));
+check('الترتيب 🚨 ثم ⚠️ ثم 🔍 ثم 🔵 ثم ✅',
+  S.todayValues.slice(1).map(function (r) { return rankOf(r[0]); }).join(',') === '0,1,2,3,4');
+
+const prevSame = [['مفتاح الصف', 'البصمة', 'آخر تغيّر (الرياض)']].concat(keys.map(function (k, i) { return [k, fpOf(rows[i]), YEST]; }));
+S = buildToday(prevSame, rows, keys, NOW, 6, H17);
+check('لا تغيّر ⇒ صفر صف يدخل «اليوم» (لا تدخل كل الصفوف كل ساعة)',
+  S.stats.newKeys === 0 && S.stats.changedKeys === 0 && S.stats.unchanged === 5 && S.stats.todayCount === 0);
+check('الفراغ يُكتب سطراً لا يُحذف', S.todayValues[1][0] === 'لا تغييرات اليوم' && String(S.todayValues[1][14]).indexOf('آخر تحديث') === 0);
+check('المسح§ يُملأ ما زاد من صفوف الجولة السابقة', S.todayValues.length === 6);
+check('البصمات لا تتغيّر حين لا تغيّر',
+  JSON.stringify(S.printValues.slice(1).map(function (r) { return r[2]; })) === JSON.stringify([YEST, YEST, YEST, YEST, YEST]));
+
+const rows2 = rows.slice(); rows2[1] = mkRow('⚠️ فيه فرق', 'https://x/d/BBBBBBBBBBBBBBBBBBBBBBBBBBB/v', '', 'سبب جديد');
+S = buildToday(prevSame, rows2, keys, NOW, 6, H17);
+check('تغيّر صف واحد ⇒ يدخل وحده', S.stats.changedKeys === 1 && S.stats.todayCount === 1 && rankOf(S.todayValues[1][0]) === 1);
+check('وقت التغيّر يُحدَّث للمتغيّر وحده',
+  S.printValues[2][2] === NOW && S.printValues[1][2] === YEST);
+
+const prevGhost = prevSame.concat([['FILE:GHOSTGHOSTGHOSTGHOSTGHOSTG', 'deadbeefdeadbeef-9', '2026-09-05 10:00:00']]);
+S = buildToday(prevGhost, rows, keys, NOW, 6, H17);
+check('مفتاح غاب عن «الطلبات»§ تُحفظ بصمته كما هي', S.stats.keptAbsent === 1 && S.printValues.length === 7);
+check('ولا يدخل «اليوم»', S.stats.todayCount === 0);
+check('بصمته ووقتها لم يُمسّا',
+  S.printValues[6][1] === 'deadbeefdeadbeef-9' && S.printValues[6][2] === '2026-09-05 10:00:00');
+
+const prevToday = [['مفتاح الصف', 'البصمة', 'آخر تغيّر (الرياض)']].concat(keys.map(function (k, i) { return [k, fpOf(rows[i]), '2026-09-12 09:00:00']; }));
+S = buildToday(prevToday, rows, keys, NOW, 6, H17);
+check('تغيّر في تشغيل سابق من اليوم نفسه يبقى في «اليوم»', S.stats.changedKeys === 0 && S.stats.todayCount === 5);
+S = buildToday(prevSame, rows, keys, '2026-09-13 00:10:00', 6, H17);
+check('بعد منتصف الليل يفرغ التبويب تلقائياً', S.stats.todayCount === 0 && S.todayValues[1][0] === 'لا تغييرات اليوم');
+
+const dupKeys = keys.slice(); dupKeys[4] = dupKeys[0];
+S = buildToday(prevSame, rows, dupKeys, NOW, 6, H17);
+check('مفتاح مكرر يُعدّ ولا يُكتب مرتين', S.stats.duplicateKeys === 1 && S.printValues.length === 5 + 1 - 1 + 1);
+
+// صف التفريغ يغطي كل أعمدة الترويسة دائماً — لا عمود يبقى بقيمة تشغيل أقدم
+function padBody(body, prevRows, header) {
+  const b = body.map(function (r) { return r.slice(); });
+  while (b.length < prevRows) b.push(new Array(header.length).fill(''));
+  return b;
+}
+const OLD = ['قيمة قديمة', 'x', 'y'];
+let PB = padBody([H17, ['✅ مطابق'].concat(new Array(16).fill(''))], 5, H17);
+check('صف التفريغ بطول الترويسة كاملاً', PB.slice(2).every(function (r) { return r.length === H17.length; }), PB[2] && PB[2].length);
+check('صف التفريغ لا يحمل أي قيمة', PB.slice(2).every(function (r) { return r.every(function (c) { return c === ''; }); }));
+check('العمود الأخير (Q) يُمسح في صف التفريغ',
+  PB.slice(2).every(function (r) { return r[H17.length - 1] === '' && r.length > 16; }));
+const H18 = H17.concat(['عمود ثامن عشر']);
+PB = padBody([H18], 3, H18);
+check('إضافة عمود ثامن عشر§ التفريغ يتبع بلا تعديل يدوي',
+  PB.slice(1).every(function (r) { return r.length === 18 && r[17] === ''; }), PB[1] && PB[1].length);
+check('لا خلية في نطاق الترويسة تحمل قيمة من تشغيل أقدم',
+  padBody([H17], 2, H17)[1].filter(function (c, i) { return c === OLD[i]; }).length === 0);
+
 console.log('\n' + '='.repeat(60));
 if (failed) { console.log('سقطت ' + failed + ' حالة'); process.exit(1); }
 console.log('كل الاختبارات نجحت ✅');
